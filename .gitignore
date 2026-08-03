@@ -1,0 +1,43 @@
+# Python cache and local build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+*.conda/
+
+# IDE and local history
+.idea/
+.vscode/
+.history/
+
+# Experiment outputs and checkpoints
+results/
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Local datasets and generated reports
+/data/
+/datasets/
+/DEAP/
+/FACED/
+/SEED/
+/SEED_IV/
+/SEED_V/
+/DREAMER/
+阶段报告输出/
+
+# OS files
+.DS_Store
+Thumbs.db
