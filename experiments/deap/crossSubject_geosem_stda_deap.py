@@ -18,6 +18,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader, TensorDataset
@@ -517,7 +518,110 @@ def build_geometry_for_fold(session_data, source_ids, target_id, device, shrinka
                     eps=eps,
                 ).cpu())
             r_by_subject[sid] = torch.cat(parts, dim=0)
-    return r_by_subject
+    return r_by_subject, log_ref
+
+
+def _source_weight_tensor(source_weights, n_sources, device):
+    if source_weights is None:
+        return torch.full((n_sources,), 1.0 / max(n_sources, 1), device=device)
+    weights = torch.as_tensor(source_weights, dtype=torch.float32, device=device)
+    return weights / weights.sum().clamp_min(1e-8)
+
+
+def _rsg_partner_indices(labels):
+    partners = torch.full_like(labels, fill_value=-1)
+    for cls in labels.unique().tolist():
+        cls_idx = torch.nonzero(labels == cls, as_tuple=False).flatten()
+        if cls_idx.numel() < 2:
+            continue
+        perm = cls_idx[torch.randperm(cls_idx.numel(), device=labels.device)]
+        rolled = torch.roll(perm, shifts=1)
+        same = rolled == cls_idx
+        if same.any():
+            rolled[same] = torch.roll(rolled, shifts=1)[same]
+        partners[cls_idx] = rolled
+    return partners
+
+
+def _rsg_structured_cutmix(x, r, labels, args):
+    """Reliability-aware semantic-geometric CutMix v1 within a selected source batch."""
+    if torch.rand((), device=x.device).item() > args.rsg_prob:
+        return None, None
+
+    partners = _rsg_partner_indices(labels)
+    valid = partners >= 0
+    if valid.sum().item() < 2:
+        return None, None
+
+    x_base = x[valid].clone()
+    x_pair = x[partners[valid]]
+    r_valid = r[valid]
+    y_mix = labels[valid]
+
+    bsz, steps, channels, bands = x_base.shape
+    time_min = max(1, min(args.rsg_time_min, steps))
+    time_max = max(time_min, min(args.rsg_time_max, steps))
+    band_width = max(1, min(args.rsg_band_width, bands))
+    channel_count = max(1, min(channels, int(round(channels * args.rsg_channel_ratio))))
+
+    for idx in range(bsz):
+        t_len = int(torch.randint(time_min, time_max + 1, (1,), device=x.device).item())
+        t0 = int(torch.randint(0, steps - t_len + 1, (1,), device=x.device).item())
+        b0 = int(torch.randint(0, bands - band_width + 1, (1,), device=x.device).item())
+        center = int(torch.randint(0, channels, (1,), device=x.device).item())
+
+        geo_scores = r_valid[idx].abs()[center]
+        channel_idx = torch.topk(geo_scores, k=channel_count, largest=True).indices
+        x_base[idx, t0:t0 + t_len, channel_idx, b0:b0 + band_width] = (
+            x_pair[idx, t0:t0 + t_len, channel_idx, b0:b0 + band_width]
+        )
+
+    return x_base, y_mix
+
+
+def rsg_cutmix_proto_loss(
+    model,
+    x_src_list,
+    r_src_list,
+    y_src_list,
+    text_prototypes,
+    log_reference,
+    args,
+    class_weights_list=None,
+    source_weights=None,
+):
+    if class_weights_list is None:
+        class_weights_list = [None] * len(x_src_list)
+    text_prototypes = F.normalize(text_prototypes.to(args.device), dim=-1)
+    source_weight_vec = _source_weight_tensor(source_weights, len(x_src_list), args.device)
+    losses = []
+    weights = []
+
+    for src_idx, (x_src, r_src, y_src, class_weights) in enumerate(
+        zip(x_src_list, r_src_list, y_src_list, class_weights_list)
+    ):
+        x_mix, y_mix = _rsg_structured_cutmix(x_src, r_src, y_src, args)
+        if x_mix is None:
+            continue
+        r_mix = tangent_deviation(
+            x_mix,
+            log_reference,
+            shrinkage=args.shrinkage,
+            eps=args.spd_eps,
+        )
+        h_mix, _ = model.encode(x_mix, r_mix)
+        z_mix = model.prototype_head(model.adapters[src_idx](h_mix))
+        logits = z_mix @ text_prototypes.T / args.proto_tau
+        losses.append(F.cross_entropy(logits, y_mix, weight=class_weights))
+        weights.append(source_weight_vec[src_idx])
+
+    if not losses:
+        return torch.zeros((), device=args.device)
+
+    losses = torch.stack(losses)
+    weights = torch.stack(weights)
+    weights = weights / weights.sum().clamp_min(1e-8)
+    return (weights * losses).sum()
 
 
 def evaluate(model, loader, text_prototypes, source_centroids, device, proto_tau, fusion_tau):
@@ -552,6 +656,19 @@ def run(args):
         args.source_selection = "fixed_top_m"
     if args.source_selection == "sparse_reliability" and args.sparse_k_max <= 0:
         raise ValueError("sparse_k_max must be positive when using sparse_reliability")
+    if args.use_rsg_cutmix:
+        if not (0.0 <= args.rsg_prob <= 1.0):
+            raise ValueError(f"rsg_prob must be in [0, 1], got {args.rsg_prob}")
+        if args.rsg_lambda_aug < 0.0:
+            raise ValueError(f"rsg_lambda_aug must be >= 0, got {args.rsg_lambda_aug}")
+        if args.rsg_time_min <= 0 or args.rsg_time_max <= 0:
+            raise ValueError("rsg_time_min and rsg_time_max must be positive")
+        if args.rsg_time_min > args.rsg_time_max:
+            raise ValueError("rsg_time_min must be <= rsg_time_max")
+        if args.rsg_band_width <= 0:
+            raise ValueError("rsg_band_width must be positive")
+        if not (0.0 < args.rsg_channel_ratio <= 1.0):
+            raise ValueError(f"rsg_channel_ratio must be in (0, 1], got {args.rsg_channel_ratio}")
     has_target_subset = args.target_subject_ids is not None or args.random_target_count is not None
     has_dataset_subject_subset = (
         args.subject_ids is not None
@@ -574,6 +691,11 @@ def run(args):
         f"lmda{_format_float(args.lambda_max)}_tau{_format_float(args.proto_tau)}_"
         f"topk{args.topk}_seed{args.seed}_{timestamp}"
     )
+    if args.use_rsg_cutmix:
+        run_id = (
+            f"{run_id}_rsgp{_format_float(args.rsg_prob)}_"
+            f"augl{_format_float(args.rsg_lambda_aug)}"
+        )
     run_dir = os.path.join(output_dir, "runs", run_id)
     os.makedirs(run_dir, exist_ok=True)
     epoch_log_path = os.path.join(run_dir, "epoch_log.csv")
@@ -651,6 +773,13 @@ def run(args):
         "rel_cond_weight": args.rel_cond_weight,
         "rel_val_weight": args.rel_val_weight,
         "class_weighted_loss": args.class_weighted_loss,
+        "use_rsg_cutmix": args.use_rsg_cutmix,
+        "rsg_prob": args.rsg_prob,
+        "rsg_lambda_aug": args.rsg_lambda_aug,
+        "rsg_time_min": args.rsg_time_min,
+        "rsg_time_max": args.rsg_time_max,
+        "rsg_band_width": args.rsg_band_width,
+        "rsg_channel_ratio": args.rsg_channel_ratio,
         "eval_interval": args.eval_interval,
         "created_at": timestamp,
     }
@@ -672,7 +801,7 @@ def run(args):
     target_records = []
     epoch_fields = [
         "run_id", "session_idx", "target_subject", "epoch",
-        "loss", "proto", "mmd", "lambda", "acc", "macro_f1", "micro_f1",
+        "loss", "proto", "mmd", "aug", "lambda", "acc", "macro_f1", "micro_f1",
         "best_acc", "alpha_mean", "epochs", "batch_size", "lr", "seed",
     ]
 
@@ -699,7 +828,7 @@ def run(args):
             )
             print(f"{'=' * 60}")
 
-            r_by_subject = build_geometry_for_fold(
+            r_by_subject, log_reference = build_geometry_for_fold(
                 data[session_idx],
                 source_ids,
                 target_sub,
@@ -795,6 +924,7 @@ def run(args):
                 epoch_loss = 0.0
                 epoch_proto = 0.0
                 epoch_mmd = 0.0
+                epoch_aug = 0.0
                 alpha_values = []
 
                 for _ in range(steps_per_epoch):
@@ -835,6 +965,20 @@ def run(args):
                     loss_mmd = multisource_mmd(z_src_all, z_tgt_all, source_weights=source_loss_weights)
                     lambda_val = lambda_warmup(global_step, total_steps, args.lambda_max)
                     loss = loss_proto + lambda_val * loss_mmd
+                    loss_aug = torch.zeros((), device=args.device)
+                    if args.use_rsg_cutmix:
+                        loss_aug = rsg_cutmix_proto_loss(
+                            model,
+                            x_src_list,
+                            r_src_list,
+                            y_src_list,
+                            text_prototypes,
+                            log_reference,
+                            args,
+                            class_weights_list=source_class_weights,
+                            source_weights=source_loss_weights,
+                        )
+                        loss = loss + args.rsg_lambda_aug * loss_aug
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                     optimizer.step()
@@ -842,6 +986,7 @@ def run(args):
                     epoch_loss += loss.item()
                     epoch_proto += loss_proto.item()
                     epoch_mmd += loss_mmd.item()
+                    epoch_aug += loss_aug.item()
                     if alpha_src:
                         alpha_values.append(torch.cat([a.detach().cpu() for a in alpha_src]).mean().item())
                     alpha_values.append(alpha_tgt.detach().cpu().mean().item())
@@ -885,6 +1030,7 @@ def run(args):
                         f"Ep {epoch + 1:3d} | loss={epoch_loss / steps_per_epoch:.4f} "
                         f"proto={epoch_proto / steps_per_epoch:.4f} "
                         f"mmd={epoch_mmd / steps_per_epoch:.6f} "
+                        f"aug={epoch_aug / steps_per_epoch:.4f} "
                         f"lambda={lambda_val:.4f} acc={acc_text} "
                         f"best={best_acc:.4f} alpha={mean_alpha:.3f}"
                     )
@@ -900,6 +1046,7 @@ def run(args):
                         "loss": epoch_loss / steps_per_epoch,
                         "proto": epoch_proto / steps_per_epoch,
                         "mmd": epoch_mmd / steps_per_epoch,
+                        "aug": epoch_aug / steps_per_epoch,
                         "lambda": lambda_val,
                         "acc": acc,
                         "macro_f1": macro_f1,
@@ -1005,6 +1152,20 @@ if __name__ == "__main__":
     parser.add_argument("--rel_marg_weight", type=float, default=1.0)
     parser.add_argument("--rel_cond_weight", type=float, default=1.0)
     parser.add_argument("--rel_val_weight", type=float, default=0.2)
+    parser.add_argument("--use_rsg_cutmix", action="store_true",
+                        help="enable reliability-aware semantic-geometric structured EEG CutMix")
+    parser.add_argument("--rsg_prob", type=float, default=0.3,
+                        help="probability of applying RSG-CutMix to a selected source batch")
+    parser.add_argument("--rsg_lambda_aug", type=float, default=0.1,
+                        help="weight of the RSG-CutMix prototype loss")
+    parser.add_argument("--rsg_time_min", type=int, default=2,
+                        help="minimum contiguous time windows replaced by RSG-CutMix")
+    parser.add_argument("--rsg_time_max", type=int, default=4,
+                        help="maximum contiguous time windows replaced by RSG-CutMix")
+    parser.add_argument("--rsg_band_width", type=int, default=1,
+                        help="number of adjacent frequency bands replaced by RSG-CutMix")
+    parser.add_argument("--rsg_channel_ratio", type=float, default=0.25,
+                        help="ratio of geometry-neighbor channels replaced by RSG-CutMix")
     parser.add_argument("--class_weighted_loss", action="store_true", default=True,
                         help="use source-wise class weights in prototype CE")
     parser.add_argument("--no_class_weighted_loss", action="store_false", dest="class_weighted_loss")

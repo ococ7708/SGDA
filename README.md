@@ -13,6 +13,7 @@ Main files:
 - `models/geosem_stda.py`: GeoSem-STDA model components.
 - `experiments/deap/crossSubject_geosem_stda_deap.py`: DEAP cross-subject experiment script.
 - `experiments/deap/run_geosem_stda_deap_5target_full.ps1`: fixed 5-target full-protocol launcher.
+- `experiments/deap/run_geosem_stda_deap_5target_rsg_cutmix_full.ps1`: fixed 5-target RSG-CutMix launcher.
 - `docs/GEOSEM_STDA_ABLATION_BRIEF.md`: complete current experiment summary for ablation collaborators.
 
 ## Model Overview
@@ -29,6 +30,8 @@ GeoSem-STDA currently includes:
 - Prototype classification loss and source-target MMD alignment loss.
 
 The multi-source branch is still present, but the current experiment reduces the final training sources from 31 candidate subjects to 6 selected sources for each target subject.
+
+An optional RSG-CutMix module can be enabled with `--use_rsg_cutmix`. It is disabled by default so the existing baseline protocol remains unchanged.
 
 ## Data
 
@@ -126,3 +129,13 @@ Per-target results:
 | S32 | 31 | 6 | 60.00 | 59.90 | 60.00 |
 
 See `docs/GEOSEM_STDA_ABLATION_BRIEF.md` for the complete comparison and recommended next ablations.
+
+## Run RSG-CutMix
+
+PowerShell:
+
+```powershell
+.\experiments\deap\run_geosem_stda_deap_5target_rsg_cutmix_full.ps1
+```
+
+This keeps the same 5-target full protocol and adds the optional reliability-aware semantic-geometric structured EEG CutMix loss.
