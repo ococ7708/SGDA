@@ -341,6 +341,63 @@ def multisource_mmd(z_src_all, z_tgt_all, source_weights=None):
     return (weights * losses).sum()
 
 
+def multisource_class_aware_mmd(
+    z_src_all,
+    z_tgt_all,
+    y_src_list,
+    text_prototypes,
+    tau=0.07,
+    num_classes=2,
+    source_weights=None,
+    confidence_gate="none",
+    confidence_threshold=0.6,
+    eps=1e-6,
+):
+    text_prototypes = F.normalize(text_prototypes, dim=-1)
+    losses = []
+
+    for z_src, z_tgt, y_src in zip(z_src_all, z_tgt_all, y_src_list):
+        logits_t = z_tgt @ text_prototypes.T / tau
+        q_t = F.softmax(logits_t, dim=-1).detach()
+        conf = q_t.max(dim=-1).values.detach()
+
+        if confidence_gate == "soft":
+            q_t = q_t * conf.unsqueeze(-1)
+        elif confidence_gate == "threshold":
+            q_t = q_t * (conf >= confidence_threshold).float().unsqueeze(-1)
+        elif confidence_gate != "none":
+            raise ValueError(f"Unsupported confidence_gate: {confidence_gate}")
+
+        class_losses = []
+        class_weights = []
+        for cls in range(num_classes):
+            src_mask = y_src == cls
+            if src_mask.any():
+                src_center = z_src[src_mask].mean(dim=0)
+            else:
+                src_center = z_src.mean(dim=0)
+
+            tgt_weight = q_t[:, cls].sum()
+            if tgt_weight <= eps:
+                continue
+            tgt_center = (q_t[:, cls:cls + 1] * z_tgt).sum(dim=0) / tgt_weight.clamp_min(eps)
+            class_losses.append(((src_center - tgt_center) ** 2).sum())
+            class_weights.append(tgt_weight / q_t.sum().clamp_min(eps))
+
+        if class_losses:
+            class_losses = torch.stack(class_losses)
+            class_weights = torch.stack(class_weights)
+            class_weights = class_weights / class_weights.sum().clamp_min(eps)
+            losses.append((class_weights * class_losses).sum())
+        else:
+            delta = z_src.mean(dim=0) - z_tgt.mean(dim=0)
+            losses.append((delta * delta).sum())
+
+    losses = torch.stack(losses)
+    weights = _normalize_source_weights(source_weights, len(losses), losses.device)
+    return (weights * losses).sum()
+
+
 def lambda_warmup(step, total_steps, lambda_max):
     if total_steps <= 0:
         return float(lambda_max)

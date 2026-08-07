@@ -139,3 +139,37 @@ PowerShell:
 ```
 
 This keeps the same 5-target full protocol and adds the optional reliability-aware semantic-geometric structured EEG CutMix loss.
+
+## Run MMD Experiments
+
+The MMD experiments keep the senior target-best reporting protocol unchanged.
+
+Lambda ablation:
+
+```powershell
+.\experiments\deap\run_geosem_stda_deap_5target_mmd_lambda_ablation.ps1
+```
+
+This runs:
+
+```text
+lambda_max = 0.0, 0.05, 0.1, 0.2, 0.3
+mmd_type = marginal
+mmd_schedule = monotonic
+```
+
+Recommended class-aware scheduled MMD:
+
+```powershell
+.\experiments\deap\run_geosem_stda_deap_5target_classaware_mmd_full.ps1
+```
+
+This runs:
+
+```text
+mmd_type = class_aware
+mmd_schedule = warmup_decay
+lambda_max = 0.2
+lambda_min = 0.05
+mmd_confidence_gate = soft
+```

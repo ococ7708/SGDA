@@ -36,6 +36,7 @@ from models.geosem_stda import (
     compute_source_class_centroids,
     lambda_warmup,
     log_euclidean_reference,
+    multisource_class_aware_mmd,
     multisource_mmd,
     predict_class_aware,
     prototype_contrastive_loss,
@@ -270,12 +271,52 @@ def _make_model(args, n_sources, channels, num_freq_bands, text_dim):
     ).to(args.device)
 
 
+def _compute_lambda_value(step, total_steps, args):
+    if args.mmd_schedule == "monotonic":
+        return lambda_warmup(step, total_steps, args.lambda_max)
+
+    progress = min(max(step / max(total_steps, 1), 0.0), 1.0)
+    warmup_ratio = max(args.mmd_warmup_ratio, 1e-6)
+    hold_ratio = max(args.mmd_hold_ratio, warmup_ratio)
+
+    if progress <= warmup_ratio:
+        return float(args.lambda_max) * progress / warmup_ratio
+
+    if args.mmd_schedule == "warmup_hold" or progress <= hold_ratio:
+        return float(args.lambda_max)
+
+    if args.mmd_schedule == "warmup_decay":
+        decay_progress = (progress - hold_ratio) / max(1.0 - hold_ratio, 1e-6)
+        return float(args.lambda_max + (args.lambda_min - args.lambda_max) * decay_progress)
+
+    raise ValueError(f"Unsupported mmd_schedule: {args.mmd_schedule}")
+
+
+def _compute_mmd_loss(z_src_all, z_tgt_all, y_src_list, text_prototypes, num_classes, args, source_weights=None):
+    if args.mmd_type == "marginal":
+        return multisource_mmd(z_src_all, z_tgt_all, source_weights=source_weights)
+    if args.mmd_type == "class_aware":
+        return multisource_class_aware_mmd(
+            z_src_all,
+            z_tgt_all,
+            y_src_list,
+            text_prototypes,
+            tau=args.proto_tau,
+            num_classes=num_classes,
+            source_weights=source_weights,
+            confidence_gate=args.mmd_confidence_gate,
+            confidence_threshold=args.mmd_confidence_threshold,
+        )
+    raise ValueError(f"Unsupported mmd_type: {args.mmd_type}")
+
+
 def _train_selection_warmup(
     model,
     source_loaders,
     target_loader,
     text_prototypes,
     class_weights,
+    num_classes,
     args,
 ):
     if args.reliability_warmup_epochs <= 0:
@@ -325,8 +366,15 @@ def _train_selection_warmup(
                 tau=args.proto_tau,
                 class_weights_list=class_weights,
             )
-            loss_mmd = multisource_mmd(z_src_all, z_tgt_all)
-            lambda_val = lambda_warmup(step, total_steps, args.lambda_max)
+            loss_mmd = _compute_mmd_loss(
+                z_src_all,
+                z_tgt_all,
+                y_src_list,
+                text_prototypes,
+                num_classes,
+                args,
+            )
+            lambda_val = _compute_lambda_value(step, total_steps, args)
             loss = loss_proto + lambda_val * loss_mmd
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -656,6 +704,18 @@ def run(args):
         args.source_selection = "fixed_top_m"
     if args.source_selection == "sparse_reliability" and args.sparse_k_max <= 0:
         raise ValueError("sparse_k_max must be positive when using sparse_reliability")
+    if args.mmd_warmup_ratio <= 0.0 or args.mmd_warmup_ratio > 1.0:
+        raise ValueError(f"mmd_warmup_ratio must be in (0, 1], got {args.mmd_warmup_ratio}")
+    if args.mmd_hold_ratio < args.mmd_warmup_ratio or args.mmd_hold_ratio > 1.0:
+        raise ValueError(
+            f"mmd_hold_ratio must be in [{args.mmd_warmup_ratio}, 1], got {args.mmd_hold_ratio}"
+        )
+    if args.lambda_min < 0.0:
+        raise ValueError(f"lambda_min must be >= 0, got {args.lambda_min}")
+    if args.mmd_confidence_gate == "threshold" and not (0.0 <= args.mmd_confidence_threshold <= 1.0):
+        raise ValueError(
+            f"mmd_confidence_threshold must be in [0, 1], got {args.mmd_confidence_threshold}"
+        )
     if args.use_rsg_cutmix:
         if not (0.0 <= args.rsg_prob <= 1.0):
             raise ValueError(f"rsg_prob must be in [0, 1], got {args.rsg_prob}")
@@ -691,6 +751,8 @@ def run(args):
         f"lmda{_format_float(args.lambda_max)}_tau{_format_float(args.proto_tau)}_"
         f"topk{args.topk}_seed{args.seed}_{timestamp}"
     )
+    if args.mmd_type != "marginal" or args.mmd_schedule != "monotonic":
+        run_id = f"{run_id}_{args.mmd_type}_{args.mmd_schedule}"
     if args.use_rsg_cutmix:
         run_id = (
             f"{run_id}_rsgp{_format_float(args.rsg_prob)}_"
@@ -739,6 +801,13 @@ def run(args):
         "lr": args.lr,
         "seed": args.seed,
         "lambda_max": args.lambda_max,
+        "lambda_min": args.lambda_min,
+        "mmd_type": args.mmd_type,
+        "mmd_schedule": args.mmd_schedule,
+        "mmd_warmup_ratio": args.mmd_warmup_ratio,
+        "mmd_hold_ratio": args.mmd_hold_ratio,
+        "mmd_confidence_gate": args.mmd_confidence_gate,
+        "mmd_confidence_threshold": args.mmd_confidence_threshold,
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -887,6 +956,7 @@ def run(args):
                     target_train_loader,
                     text_prototypes,
                     source_class_weights,
+                    num_classes,
                     args,
                 )
                 selected_ids, selected_weights = sparse_reliability_source_selection(
@@ -962,8 +1032,16 @@ def run(args):
                         class_weights_list=source_class_weights,
                         source_weights=source_loss_weights,
                     )
-                    loss_mmd = multisource_mmd(z_src_all, z_tgt_all, source_weights=source_loss_weights)
-                    lambda_val = lambda_warmup(global_step, total_steps, args.lambda_max)
+                    loss_mmd = _compute_mmd_loss(
+                        z_src_all,
+                        z_tgt_all,
+                        y_src_list,
+                        text_prototypes,
+                        num_classes,
+                        args,
+                        source_weights=source_loss_weights,
+                    )
+                    lambda_val = _compute_lambda_value(global_step, total_steps, args)
                     loss = loss_proto + lambda_val * loss_mmd
                     loss_aug = torch.zeros((), device=args.device)
                     if args.use_rsg_cutmix:
@@ -1102,6 +1180,13 @@ def run(args):
         "lr": args.lr,
         "seed": args.seed,
         "lambda_max": args.lambda_max,
+        "lambda_min": args.lambda_min,
+        "mmd_type": args.mmd_type,
+        "mmd_schedule": args.mmd_schedule,
+        "mmd_warmup_ratio": args.mmd_warmup_ratio,
+        "mmd_hold_ratio": args.mmd_hold_ratio,
+        "mmd_confidence_gate": args.mmd_confidence_gate,
+        "mmd_confidence_threshold": args.mmd_confidence_threshold,
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -1127,6 +1212,15 @@ if __name__ == "__main__":
     parser = get_args_parser()
     parser.set_defaults(epochs=200, batch_size=64, lr=1e-3, sample_length=9, stride=3)
     parser.add_argument("--lambda_max", type=float, default=0.3)
+    parser.add_argument("--lambda_min", type=float, default=0.0)
+    parser.add_argument("--mmd_type", type=str, default="marginal", choices=["marginal", "class_aware"])
+    parser.add_argument("--mmd_schedule", type=str, default="monotonic",
+                        choices=["monotonic", "warmup_hold", "warmup_decay"])
+    parser.add_argument("--mmd_warmup_ratio", type=float, default=0.2)
+    parser.add_argument("--mmd_hold_ratio", type=float, default=0.5)
+    parser.add_argument("--mmd_confidence_gate", type=str, default="none",
+                        choices=["none", "soft", "threshold"])
+    parser.add_argument("--mmd_confidence_threshold", type=float, default=0.6)
     parser.add_argument("--proto_tau", type=float, default=0.07)
     parser.add_argument("--fusion_tau", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=6)
