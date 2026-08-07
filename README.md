@@ -16,6 +16,8 @@ Main files:
 - `experiments/deap/run_geosem_stda_deap_5target_rsg_cutmix_full.ps1`: fixed 5-target RSG-CutMix launcher.
 - `experiments/deap/run_geosem_stda_deap_5target_sca_full.ps1`: fixed 5-target SCA launcher.
 - `experiments/deap/run_geosem_stda_deap_5target_resgca_full.ps1`: fixed 5-target ReSGCA launcher.
+- `experiments/seediv/crossSubject_geosem_stda_seediv.py`: SEED-IV GeoSem-STDA/ReSGCA cross-subject experiment script.
+- `experiments/seediv/run_geosem_stda_seediv_5target_resgca_full.ps1`: fixed 5-target SEED-IV ReSGCA launcher.
 - `docs/GEOSEM_STDA_ABLATION_BRIEF.md`: complete current experiment summary for ablation collaborators.
 
 ## Model Overview
@@ -183,6 +185,22 @@ resgca_geo_weight = 1.0
 ```
 
 See `docs/ReSGCA_MODEL_DESIGN.md` for the model formulation, ablation chain, and dataset suitability judgment.
+
+## Run SEED-IV ReSGCA
+
+Quick smoke test:
+
+```powershell
+.\experiments\seediv\run_geosem_stda_seediv_smoke.ps1
+```
+
+Fixed 5-target SEED-IV run:
+
+```powershell
+.\experiments\seediv\run_geosem_stda_seediv_5target_resgca_full.ps1
+```
+
+The SEED-IV script uses 4 semantic emotion classes, 62 channels, subject-wise z-score normalization, sparse reliability source selection, and streaming Log-Euclidean geometry construction to reduce GPU memory pressure.
 
 ## Run MMD Experiments
 
