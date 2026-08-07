@@ -38,6 +38,7 @@ from models.geosem_stda import (
     log_euclidean_reference,
     multisource_class_aware_mmd,
     multisource_mmd,
+    multisource_resgca,
     multisource_semantic_conditional_alignment,
     predict_class_aware,
     prototype_contrastive_loss,
@@ -314,6 +315,8 @@ def _compute_mmd_loss(
     source_weights=None,
     step=None,
     total_steps=None,
+    r_src_list=None,
+    r_tgt=None,
 ):
     if args.mmd_type == "marginal":
         return multisource_mmd(z_src_all, z_tgt_all, source_weights=source_weights)
@@ -342,6 +345,26 @@ def _compute_mmd_loss(
             confidence_gate=args.mmd_confidence_gate,
             confidence_threshold=args.mmd_confidence_threshold,
             conditional_mu=conditional_mu,
+        )
+    if args.mmd_type == "resgca":
+        if r_src_list is None or r_tgt is None:
+            raise ValueError("r_src_list and r_tgt are required when mmd_type='resgca'")
+        conditional_mu = _compute_sca_mu(step or 0, total_steps or 1, args)
+        return multisource_resgca(
+            z_src_all,
+            z_tgt_all,
+            y_src_list,
+            r_src_list,
+            r_tgt,
+            text_prototypes,
+            tau=args.proto_tau,
+            num_classes=num_classes,
+            source_weights=source_weights,
+            confidence_gate=args.mmd_confidence_gate,
+            confidence_threshold=args.mmd_confidence_threshold,
+            conditional_mu=conditional_mu,
+            geo_tau=args.resgca_geo_tau,
+            geo_weight=args.resgca_geo_weight,
         )
     raise ValueError(f"Unsupported mmd_type: {args.mmd_type}")
 
@@ -411,6 +434,8 @@ def _train_selection_warmup(
                 args,
                 step=step,
                 total_steps=total_steps,
+                r_src_list=r_src_list,
+                r_tgt=r_tb.to(args.device),
             )
             lambda_val = _compute_lambda_value(step, total_steps, args)
             loss = loss_proto + lambda_val * loss_mmd
@@ -758,6 +783,10 @@ def run(args):
         raise ValueError("sca_mu_start and sca_mu_end must be in [0, 1]")
     if args.sca_mu_warmup_ratio <= 0.0 or args.sca_mu_warmup_ratio > 1.0:
         raise ValueError(f"sca_mu_warmup_ratio must be in (0, 1], got {args.sca_mu_warmup_ratio}")
+    if args.resgca_geo_tau <= 0.0:
+        raise ValueError(f"resgca_geo_tau must be positive, got {args.resgca_geo_tau}")
+    if args.resgca_geo_weight < 0.0:
+        raise ValueError(f"resgca_geo_weight must be >= 0, got {args.resgca_geo_weight}")
     if args.use_rsg_cutmix:
         if not (0.0 <= args.rsg_prob <= 1.0):
             raise ValueError(f"rsg_prob must be in [0, 1], got {args.rsg_prob}")
@@ -853,6 +882,8 @@ def run(args):
         "sca_mu_start": args.sca_mu_start,
         "sca_mu_end": args.sca_mu_end,
         "sca_mu_warmup_ratio": args.sca_mu_warmup_ratio,
+        "resgca_geo_tau": args.resgca_geo_tau,
+        "resgca_geo_weight": args.resgca_geo_weight,
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -1088,9 +1119,15 @@ def run(args):
                         source_weights=source_loss_weights,
                         step=global_step,
                         total_steps=total_steps,
+                        r_src_list=r_src_list,
+                        r_tgt=r_tb.to(args.device),
                     )
                     lambda_val = _compute_lambda_value(global_step, total_steps, args)
-                    sca_mu_val = _compute_sca_mu(global_step, total_steps, args) if args.mmd_type == "sca" else np.nan
+                    sca_mu_val = (
+                        _compute_sca_mu(global_step, total_steps, args)
+                        if args.mmd_type in ("sca", "resgca")
+                        else np.nan
+                    )
                     loss = loss_proto + lambda_val * loss_mmd
                     loss_aug = torch.zeros((), device=args.device)
                     if args.use_rsg_cutmix:
@@ -1153,7 +1190,7 @@ def run(args):
 
                 if (epoch + 1) % args.log_interval == 0:
                     acc_text = f"{acc:.4f}" if should_eval else "skip"
-                    sca_mu_text = f" mu={sca_mu_val:.3f}" if args.mmd_type == "sca" else ""
+                    sca_mu_text = f" mu={sca_mu_val:.3f}" if args.mmd_type in ("sca", "resgca") else ""
                     print(
                         f"Ep {epoch + 1:3d} | loss={epoch_loss / steps_per_epoch:.4f} "
                         f"proto={epoch_proto / steps_per_epoch:.4f} "
@@ -1241,6 +1278,8 @@ def run(args):
         "sca_mu_start": args.sca_mu_start,
         "sca_mu_end": args.sca_mu_end,
         "sca_mu_warmup_ratio": args.sca_mu_warmup_ratio,
+        "resgca_geo_tau": args.resgca_geo_tau,
+        "resgca_geo_weight": args.resgca_geo_weight,
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -1267,7 +1306,7 @@ if __name__ == "__main__":
     parser.set_defaults(epochs=200, batch_size=64, lr=1e-3, sample_length=9, stride=3)
     parser.add_argument("--lambda_max", type=float, default=0.3)
     parser.add_argument("--lambda_min", type=float, default=0.0)
-    parser.add_argument("--mmd_type", type=str, default="marginal", choices=["marginal", "class_aware", "sca"])
+    parser.add_argument("--mmd_type", type=str, default="marginal", choices=["marginal", "class_aware", "sca", "resgca"])
     parser.add_argument("--mmd_schedule", type=str, default="monotonic",
                         choices=["monotonic", "warmup_hold", "warmup_decay", "warmup_cosine_decay"])
     parser.add_argument("--mmd_warmup_ratio", type=float, default=0.2)
@@ -1281,6 +1320,10 @@ if __name__ == "__main__":
                         help="final conditional-alignment ratio for --mmd_type sca")
     parser.add_argument("--sca_mu_warmup_ratio", type=float, default=0.5,
                         help="fraction of training used to ramp SCA from marginal to conditional")
+    parser.add_argument("--resgca_geo_tau", type=float, default=1.0,
+                        help="temperature for geometry trust in --mmd_type resgca")
+    parser.add_argument("--resgca_geo_weight", type=float, default=1.0,
+                        help="strength of geometry trust in --mmd_type resgca; 0 disables geometry gating")
     parser.add_argument("--proto_tau", type=float, default=0.07)
     parser.add_argument("--fusion_tau", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=6)

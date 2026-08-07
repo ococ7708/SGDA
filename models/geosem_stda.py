@@ -442,6 +442,87 @@ def multisource_semantic_conditional_alignment(
     return (1.0 - conditional_mu) * marg + conditional_mu * cond
 
 
+def _flatten_geometry(r):
+    return r.flatten(start_dim=1)
+
+
+def multisource_resgca(
+    z_src_all,
+    z_tgt_all,
+    y_src_list,
+    r_src_list,
+    r_tgt,
+    text_prototypes,
+    tau=0.07,
+    num_classes=2,
+    source_weights=None,
+    confidence_gate="entropy",
+    confidence_threshold=0.6,
+    conditional_mu=1.0,
+    geo_tau=1.0,
+    geo_weight=1.0,
+    eps=1e-6,
+):
+    text_prototypes = F.normalize(text_prototypes, dim=-1)
+    r_tgt_flat = _flatten_geometry(r_tgt)
+    losses = []
+
+    for z_src, z_tgt, y_src, r_src in zip(z_src_all, z_tgt_all, y_src_list, r_src_list):
+        logits_t = z_tgt @ text_prototypes.T / tau
+        q_t = F.softmax(logits_t, dim=-1).detach()
+        uncertainty_weight = _target_soft_weights(
+            q_t,
+            confidence_gate=confidence_gate,
+            confidence_threshold=confidence_threshold,
+            eps=eps,
+        )
+        r_src_flat = _flatten_geometry(r_src)
+
+        class_losses = []
+        class_weights = []
+        for cls in range(num_classes):
+            src_mask = y_src == cls
+            if src_mask.any():
+                src_center = z_src[src_mask].mean(dim=0)
+                src_geo_center = r_src_flat[src_mask].mean(dim=0)
+            else:
+                src_center = z_src.mean(dim=0)
+                src_geo_center = r_src_flat.mean(dim=0)
+
+            if geo_weight > 0.0:
+                geo_dist = ((r_tgt_flat - src_geo_center.unsqueeze(0)) ** 2).mean(dim=-1)
+                geo_trust = torch.exp(-float(geo_weight) * geo_dist / max(float(geo_tau), eps)).detach()
+            else:
+                geo_trust = torch.ones(z_tgt.size(0), device=z_tgt.device, dtype=z_tgt.dtype)
+
+            target_weight = q_t[:, cls] * uncertainty_weight * geo_trust
+            weight_sum = target_weight.sum()
+            if weight_sum <= eps:
+                continue
+
+            target_center = (target_weight.unsqueeze(-1) * z_tgt).sum(dim=0) / weight_sum.clamp_min(eps)
+            class_losses.append(((src_center - target_center) ** 2).sum())
+            class_weights.append(weight_sum)
+
+        if class_losses:
+            class_losses = torch.stack(class_losses)
+            class_weights = torch.stack(class_weights)
+            class_weights = class_weights / class_weights.sum().clamp_min(eps)
+            losses.append((class_weights * class_losses).sum())
+        else:
+            delta = z_src.mean(dim=0) - z_tgt.mean(dim=0)
+            losses.append((delta * delta).sum())
+
+    losses = torch.stack(losses)
+    source_weight_vec = _normalize_source_weights(source_weights, len(losses), losses.device)
+    cond = (source_weight_vec * losses).sum()
+    conditional_mu = float(min(max(conditional_mu, 0.0), 1.0))
+    if conditional_mu >= 1.0:
+        return cond
+    marg = multisource_mmd(z_src_all, z_tgt_all, source_weights=source_weights)
+    return (1.0 - conditional_mu) * marg + conditional_mu * cond
+
+
 def lambda_warmup(step, total_steps, lambda_max):
     if total_steps <= 0:
         return float(lambda_max)

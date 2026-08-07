@@ -15,6 +15,7 @@ Main files:
 - `experiments/deap/run_geosem_stda_deap_5target_full.ps1`: fixed 5-target full-protocol launcher.
 - `experiments/deap/run_geosem_stda_deap_5target_rsg_cutmix_full.ps1`: fixed 5-target RSG-CutMix launcher.
 - `experiments/deap/run_geosem_stda_deap_5target_sca_full.ps1`: fixed 5-target SCA launcher.
+- `experiments/deap/run_geosem_stda_deap_5target_resgca_full.ps1`: fixed 5-target ReSGCA launcher.
 - `docs/GEOSEM_STDA_ABLATION_BRIEF.md`: complete current experiment summary for ablation collaborators.
 
 ## Model Overview
@@ -160,6 +161,28 @@ lambda_min = 0.05
 ```
 
 See `docs/SCA_MODEL_DESIGN.md` for the theoretical motivation and dataset suitability judgment.
+
+## Run ReSGCA
+
+PowerShell:
+
+```powershell
+.\experiments\deap\run_geosem_stda_deap_5target_resgca_full.ps1
+```
+
+This keeps the same senior 5-target full protocol and uses reliability-guided semantic-geometric conditional alignment:
+
+```text
+mmd_type = resgca
+mmd_schedule = warmup_cosine_decay
+mmd_confidence_gate = entropy
+lambda_max = 0.2
+lambda_min = 0.05
+resgca_geo_tau = 1.0
+resgca_geo_weight = 1.0
+```
+
+See `docs/ReSGCA_MODEL_DESIGN.md` for the model formulation, ablation chain, and dataset suitability judgment.
 
 ## Run MMD Experiments
 
