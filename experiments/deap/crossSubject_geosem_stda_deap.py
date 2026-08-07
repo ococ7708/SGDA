@@ -38,6 +38,7 @@ from models.geosem_stda import (
     log_euclidean_reference,
     multisource_class_aware_mmd,
     multisource_mmd,
+    multisource_semantic_conditional_alignment,
     predict_class_aware,
     prototype_contrastive_loss,
     tangent_deviation,
@@ -289,10 +290,31 @@ def _compute_lambda_value(step, total_steps, args):
         decay_progress = (progress - hold_ratio) / max(1.0 - hold_ratio, 1e-6)
         return float(args.lambda_max + (args.lambda_min - args.lambda_max) * decay_progress)
 
+    if args.mmd_schedule == "warmup_cosine_decay":
+        decay_progress = (progress - hold_ratio) / max(1.0 - hold_ratio, 1e-6)
+        cosine = 0.5 * (1.0 + np.cos(np.pi * decay_progress))
+        return float(args.lambda_min + (args.lambda_max - args.lambda_min) * cosine)
+
     raise ValueError(f"Unsupported mmd_schedule: {args.mmd_schedule}")
 
 
-def _compute_mmd_loss(z_src_all, z_tgt_all, y_src_list, text_prototypes, num_classes, args, source_weights=None):
+def _compute_sca_mu(step, total_steps, args):
+    progress = min(max(step / max(total_steps, 1), 0.0), 1.0)
+    ramp = min(progress / max(args.sca_mu_warmup_ratio, 1e-6), 1.0)
+    return float(args.sca_mu_start + (args.sca_mu_end - args.sca_mu_start) * ramp)
+
+
+def _compute_mmd_loss(
+    z_src_all,
+    z_tgt_all,
+    y_src_list,
+    text_prototypes,
+    num_classes,
+    args,
+    source_weights=None,
+    step=None,
+    total_steps=None,
+):
     if args.mmd_type == "marginal":
         return multisource_mmd(z_src_all, z_tgt_all, source_weights=source_weights)
     if args.mmd_type == "class_aware":
@@ -306,6 +328,20 @@ def _compute_mmd_loss(z_src_all, z_tgt_all, y_src_list, text_prototypes, num_cla
             source_weights=source_weights,
             confidence_gate=args.mmd_confidence_gate,
             confidence_threshold=args.mmd_confidence_threshold,
+        )
+    if args.mmd_type == "sca":
+        conditional_mu = _compute_sca_mu(step or 0, total_steps or 1, args)
+        return multisource_semantic_conditional_alignment(
+            z_src_all,
+            z_tgt_all,
+            y_src_list,
+            text_prototypes,
+            tau=args.proto_tau,
+            num_classes=num_classes,
+            source_weights=source_weights,
+            confidence_gate=args.mmd_confidence_gate,
+            confidence_threshold=args.mmd_confidence_threshold,
+            conditional_mu=conditional_mu,
         )
     raise ValueError(f"Unsupported mmd_type: {args.mmd_type}")
 
@@ -373,6 +409,8 @@ def _train_selection_warmup(
                 text_prototypes,
                 num_classes,
                 args,
+                step=step,
+                total_steps=total_steps,
             )
             lambda_val = _compute_lambda_value(step, total_steps, args)
             loss = loss_proto + lambda_val * loss_mmd
@@ -716,6 +754,10 @@ def run(args):
         raise ValueError(
             f"mmd_confidence_threshold must be in [0, 1], got {args.mmd_confidence_threshold}"
         )
+    if not (0.0 <= args.sca_mu_start <= 1.0 and 0.0 <= args.sca_mu_end <= 1.0):
+        raise ValueError("sca_mu_start and sca_mu_end must be in [0, 1]")
+    if args.sca_mu_warmup_ratio <= 0.0 or args.sca_mu_warmup_ratio > 1.0:
+        raise ValueError(f"sca_mu_warmup_ratio must be in (0, 1], got {args.sca_mu_warmup_ratio}")
     if args.use_rsg_cutmix:
         if not (0.0 <= args.rsg_prob <= 1.0):
             raise ValueError(f"rsg_prob must be in [0, 1], got {args.rsg_prob}")
@@ -808,6 +850,9 @@ def run(args):
         "mmd_hold_ratio": args.mmd_hold_ratio,
         "mmd_confidence_gate": args.mmd_confidence_gate,
         "mmd_confidence_threshold": args.mmd_confidence_threshold,
+        "sca_mu_start": args.sca_mu_start,
+        "sca_mu_end": args.sca_mu_end,
+        "sca_mu_warmup_ratio": args.sca_mu_warmup_ratio,
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -870,7 +915,7 @@ def run(args):
     target_records = []
     epoch_fields = [
         "run_id", "session_idx", "target_subject", "epoch",
-        "loss", "proto", "mmd", "aug", "lambda", "acc", "macro_f1", "micro_f1",
+        "loss", "proto", "mmd", "aug", "lambda", "sca_mu", "acc", "macro_f1", "micro_f1",
         "best_acc", "alpha_mean", "epochs", "batch_size", "lr", "seed",
     ]
 
@@ -995,6 +1040,7 @@ def run(args):
                 epoch_proto = 0.0
                 epoch_mmd = 0.0
                 epoch_aug = 0.0
+                sca_mu_val = np.nan
                 alpha_values = []
 
                 for _ in range(steps_per_epoch):
@@ -1040,8 +1086,11 @@ def run(args):
                         num_classes,
                         args,
                         source_weights=source_loss_weights,
+                        step=global_step,
+                        total_steps=total_steps,
                     )
                     lambda_val = _compute_lambda_value(global_step, total_steps, args)
+                    sca_mu_val = _compute_sca_mu(global_step, total_steps, args) if args.mmd_type == "sca" else np.nan
                     loss = loss_proto + lambda_val * loss_mmd
                     loss_aug = torch.zeros((), device=args.device)
                     if args.use_rsg_cutmix:
@@ -1104,12 +1153,13 @@ def run(args):
 
                 if (epoch + 1) % args.log_interval == 0:
                     acc_text = f"{acc:.4f}" if should_eval else "skip"
+                    sca_mu_text = f" mu={sca_mu_val:.3f}" if args.mmd_type == "sca" else ""
                     print(
                         f"Ep {epoch + 1:3d} | loss={epoch_loss / steps_per_epoch:.4f} "
                         f"proto={epoch_proto / steps_per_epoch:.4f} "
                         f"mmd={epoch_mmd / steps_per_epoch:.6f} "
                         f"aug={epoch_aug / steps_per_epoch:.4f} "
-                        f"lambda={lambda_val:.4f} acc={acc_text} "
+                        f"lambda={lambda_val:.4f}{sca_mu_text} acc={acc_text} "
                         f"best={best_acc:.4f} alpha={mean_alpha:.3f}"
                     )
 
@@ -1126,6 +1176,7 @@ def run(args):
                         "mmd": epoch_mmd / steps_per_epoch,
                         "aug": epoch_aug / steps_per_epoch,
                         "lambda": lambda_val,
+                        "sca_mu": sca_mu_val,
                         "acc": acc,
                         "macro_f1": macro_f1,
                         "micro_f1": micro_f1,
@@ -1187,6 +1238,9 @@ def run(args):
         "mmd_hold_ratio": args.mmd_hold_ratio,
         "mmd_confidence_gate": args.mmd_confidence_gate,
         "mmd_confidence_threshold": args.mmd_confidence_threshold,
+        "sca_mu_start": args.sca_mu_start,
+        "sca_mu_end": args.sca_mu_end,
+        "sca_mu_warmup_ratio": args.sca_mu_warmup_ratio,
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -1213,14 +1267,20 @@ if __name__ == "__main__":
     parser.set_defaults(epochs=200, batch_size=64, lr=1e-3, sample_length=9, stride=3)
     parser.add_argument("--lambda_max", type=float, default=0.3)
     parser.add_argument("--lambda_min", type=float, default=0.0)
-    parser.add_argument("--mmd_type", type=str, default="marginal", choices=["marginal", "class_aware"])
+    parser.add_argument("--mmd_type", type=str, default="marginal", choices=["marginal", "class_aware", "sca"])
     parser.add_argument("--mmd_schedule", type=str, default="monotonic",
-                        choices=["monotonic", "warmup_hold", "warmup_decay"])
+                        choices=["monotonic", "warmup_hold", "warmup_decay", "warmup_cosine_decay"])
     parser.add_argument("--mmd_warmup_ratio", type=float, default=0.2)
     parser.add_argument("--mmd_hold_ratio", type=float, default=0.5)
     parser.add_argument("--mmd_confidence_gate", type=str, default="none",
-                        choices=["none", "soft", "threshold"])
+                        choices=["none", "soft", "threshold", "entropy"])
     parser.add_argument("--mmd_confidence_threshold", type=float, default=0.6)
+    parser.add_argument("--sca_mu_start", type=float, default=0.0,
+                        help="initial conditional-alignment ratio for --mmd_type sca")
+    parser.add_argument("--sca_mu_end", type=float, default=1.0,
+                        help="final conditional-alignment ratio for --mmd_type sca")
+    parser.add_argument("--sca_mu_warmup_ratio", type=float, default=0.5,
+                        help="fraction of training used to ramp SCA from marginal to conditional")
     parser.add_argument("--proto_tau", type=float, default=0.07)
     parser.add_argument("--fusion_tau", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=6)

@@ -341,6 +341,20 @@ def multisource_mmd(z_src_all, z_tgt_all, source_weights=None):
     return (weights * losses).sum()
 
 
+def _target_soft_weights(q_t, confidence_gate="none", confidence_threshold=0.6, eps=1e-6):
+    conf = q_t.max(dim=-1).values.detach()
+    if confidence_gate == "none":
+        return torch.ones_like(conf)
+    if confidence_gate == "soft":
+        return conf
+    if confidence_gate == "threshold":
+        return (conf >= confidence_threshold).float()
+    if confidence_gate == "entropy":
+        entropy = -(q_t * q_t.clamp_min(eps).log()).sum(dim=-1)
+        return (1.0 - entropy / math.log(q_t.size(-1))).clamp(0.0, 1.0).detach()
+    raise ValueError(f"Unsupported confidence_gate: {confidence_gate}")
+
+
 def multisource_class_aware_mmd(
     z_src_all,
     z_tgt_all,
@@ -359,14 +373,12 @@ def multisource_class_aware_mmd(
     for z_src, z_tgt, y_src in zip(z_src_all, z_tgt_all, y_src_list):
         logits_t = z_tgt @ text_prototypes.T / tau
         q_t = F.softmax(logits_t, dim=-1).detach()
-        conf = q_t.max(dim=-1).values.detach()
-
-        if confidence_gate == "soft":
-            q_t = q_t * conf.unsqueeze(-1)
-        elif confidence_gate == "threshold":
-            q_t = q_t * (conf >= confidence_threshold).float().unsqueeze(-1)
-        elif confidence_gate != "none":
-            raise ValueError(f"Unsupported confidence_gate: {confidence_gate}")
+        q_t = q_t * _target_soft_weights(
+            q_t,
+            confidence_gate=confidence_gate,
+            confidence_threshold=confidence_threshold,
+            eps=eps,
+        ).unsqueeze(-1)
 
         class_losses = []
         class_weights = []
@@ -396,6 +408,38 @@ def multisource_class_aware_mmd(
     losses = torch.stack(losses)
     weights = _normalize_source_weights(source_weights, len(losses), losses.device)
     return (weights * losses).sum()
+
+
+def multisource_semantic_conditional_alignment(
+    z_src_all,
+    z_tgt_all,
+    y_src_list,
+    text_prototypes,
+    tau=0.07,
+    num_classes=2,
+    source_weights=None,
+    confidence_gate="entropy",
+    confidence_threshold=0.6,
+    conditional_mu=1.0,
+    eps=1e-6,
+):
+    cond = multisource_class_aware_mmd(
+        z_src_all,
+        z_tgt_all,
+        y_src_list,
+        text_prototypes,
+        tau=tau,
+        num_classes=num_classes,
+        source_weights=source_weights,
+        confidence_gate=confidence_gate,
+        confidence_threshold=confidence_threshold,
+        eps=eps,
+    )
+    conditional_mu = float(min(max(conditional_mu, 0.0), 1.0))
+    if conditional_mu >= 1.0:
+        return cond
+    marg = multisource_mmd(z_src_all, z_tgt_all, source_weights=source_weights)
+    return (1.0 - conditional_mu) * marg + conditional_mu * cond
 
 
 def lambda_warmup(step, total_steps, lambda_max):

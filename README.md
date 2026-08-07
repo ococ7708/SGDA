@@ -14,6 +14,7 @@ Main files:
 - `experiments/deap/crossSubject_geosem_stda_deap.py`: DEAP cross-subject experiment script.
 - `experiments/deap/run_geosem_stda_deap_5target_full.ps1`: fixed 5-target full-protocol launcher.
 - `experiments/deap/run_geosem_stda_deap_5target_rsg_cutmix_full.ps1`: fixed 5-target RSG-CutMix launcher.
+- `experiments/deap/run_geosem_stda_deap_5target_sca_full.ps1`: fixed 5-target SCA launcher.
 - `docs/GEOSEM_STDA_ABLATION_BRIEF.md`: complete current experiment summary for ablation collaborators.
 
 ## Model Overview
@@ -139,6 +140,26 @@ PowerShell:
 ```
 
 This keeps the same 5-target full protocol and adds the optional reliability-aware semantic-geometric structured EEG CutMix loss.
+
+## Run SCA
+
+PowerShell:
+
+```powershell
+.\experiments\deap\run_geosem_stda_deap_5target_sca_full.ps1
+```
+
+This keeps the same senior 5-target full protocol and replaces marginal MMD with reliability-aware semantic conditional alignment:
+
+```text
+mmd_type = sca
+mmd_schedule = warmup_cosine_decay
+mmd_confidence_gate = entropy
+lambda_max = 0.2
+lambda_min = 0.05
+```
+
+See `docs/SCA_MODEL_DESIGN.md` for the theoretical motivation and dataset suitability judgment.
 
 ## Run MMD Experiments
 
