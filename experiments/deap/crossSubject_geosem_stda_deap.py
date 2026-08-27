@@ -37,6 +37,7 @@ from models.geosem_stda import (
     lambda_warmup,
     log_euclidean_reference,
     multisource_class_aware_mmd,
+    multisource_geosem_hut,
     multisource_mmd,
     multisource_resgca,
     multisource_semantic_conditional_alignment,
@@ -274,10 +275,16 @@ def _make_model(args, n_sources, channels, num_freq_bands, text_dim):
 
 
 def _compute_lambda_value(step, total_steps, args):
-    if args.mmd_schedule == "monotonic":
-        return lambda_warmup(step, total_steps, args.lambda_max)
+    raw_progress = min(max(step / max(total_steps, 1), 0.0), 1.0)
+    start_ratio = min(max(getattr(args, "mmd_start_ratio", 0.0), 0.0), 0.95)
+    if raw_progress <= start_ratio:
+        return 0.0
+    progress = (raw_progress - start_ratio) / max(1.0 - start_ratio, 1e-6)
 
-    progress = min(max(step / max(total_steps, 1), 0.0), 1.0)
+    if args.mmd_schedule == "monotonic":
+        shifted_step = max(int(round(progress * total_steps)), 1)
+        return lambda_warmup(shifted_step, total_steps, args.lambda_max)
+
     warmup_ratio = max(args.mmd_warmup_ratio, 1e-6)
     hold_ratio = max(args.mmd_hold_ratio, warmup_ratio)
 
@@ -327,6 +334,7 @@ def _compute_mmd_loss(
             y_src_list,
             text_prototypes,
             tau=args.proto_tau,
+            route_tau=getattr(args, "uot_route_tau", args.proto_tau),
             num_classes=num_classes,
             source_weights=source_weights,
             confidence_gate=args.mmd_confidence_gate,
@@ -340,6 +348,7 @@ def _compute_mmd_loss(
             y_src_list,
             text_prototypes,
             tau=args.proto_tau,
+            route_tau=getattr(args, "uot_route_tau", args.proto_tau),
             num_classes=num_classes,
             source_weights=source_weights,
             confidence_gate=args.mmd_confidence_gate,
@@ -358,6 +367,7 @@ def _compute_mmd_loss(
             r_tgt,
             text_prototypes,
             tau=args.proto_tau,
+            route_tau=getattr(args, "uot_route_tau", args.proto_tau),
             num_classes=num_classes,
             source_weights=source_weights,
             confidence_gate=args.mmd_confidence_gate,
@@ -365,6 +375,32 @@ def _compute_mmd_loss(
             conditional_mu=conditional_mu,
             geo_tau=args.resgca_geo_tau,
             geo_weight=args.resgca_geo_weight,
+        )
+    if args.mmd_type == "hut":
+        if r_src_list is None or r_tgt is None:
+            raise ValueError("r_src_list and r_tgt are required when mmd_type='hut'")
+        return multisource_geosem_hut(
+            z_src_all,
+            z_tgt_all,
+            y_src_list,
+            r_src_list,
+            r_tgt,
+            text_prototypes,
+            tau=args.proto_tau,
+            route_tau=getattr(args, "uot_route_tau", args.proto_tau),
+            num_classes=num_classes,
+            source_weights=source_weights,
+            confidence_gate=args.mmd_confidence_gate,
+            confidence_threshold=args.mmd_confidence_threshold,
+            uot_epsilon=args.uot_epsilon,
+            uot_tau_s=args.uot_tau_s,
+            uot_tau_t=args.uot_tau_t,
+            uot_n_iter=args.uot_n_iter,
+            geo_tau=args.resgca_geo_tau,
+            geo_cost_weight=args.hut_geo_cost_weight,
+            agreement_tau=args.hut_agreement_tau,
+            use_agreement_mass=getattr(args, "hut_use_agreement_mass", True),
+            use_geometry_cost=getattr(args, "hut_use_geometry_cost", True),
         )
     raise ValueError(f"Unsupported mmd_type: {args.mmd_type}")
 
@@ -773,6 +809,8 @@ def run(args):
         raise ValueError(
             f"mmd_hold_ratio must be in [{args.mmd_warmup_ratio}, 1], got {args.mmd_hold_ratio}"
         )
+    if not (0.0 <= args.mmd_start_ratio < 1.0):
+        raise ValueError(f"mmd_start_ratio must be in [0, 1), got {args.mmd_start_ratio}")
     if args.lambda_min < 0.0:
         raise ValueError(f"lambda_min must be >= 0, got {args.lambda_min}")
     if args.mmd_confidence_gate == "threshold" and not (0.0 <= args.mmd_confidence_threshold <= 1.0):
@@ -787,6 +825,16 @@ def run(args):
         raise ValueError(f"resgca_geo_tau must be positive, got {args.resgca_geo_tau}")
     if args.resgca_geo_weight < 0.0:
         raise ValueError(f"resgca_geo_weight must be >= 0, got {args.resgca_geo_weight}")
+    if args.uot_epsilon <= 0.0 or args.uot_tau_s <= 0.0 or args.uot_tau_t <= 0.0:
+        raise ValueError("uot_epsilon, uot_tau_s, and uot_tau_t must be positive")
+    if args.uot_route_tau <= 0.0:
+        raise ValueError(f"uot_route_tau must be positive, got {args.uot_route_tau}")
+    if args.uot_n_iter <= 0:
+        raise ValueError(f"uot_n_iter must be positive, got {args.uot_n_iter}")
+    if args.hut_geo_cost_weight < 0.0:
+        raise ValueError(f"hut_geo_cost_weight must be >= 0, got {args.hut_geo_cost_weight}")
+    if args.hut_agreement_tau <= 0.0:
+        raise ValueError(f"hut_agreement_tau must be positive, got {args.hut_agreement_tau}")
     if args.use_rsg_cutmix:
         if not (0.0 <= args.rsg_prob <= 1.0):
             raise ValueError(f"rsg_prob must be in [0, 1], got {args.rsg_prob}")
@@ -875,6 +923,7 @@ def run(args):
         "lambda_min": args.lambda_min,
         "mmd_type": args.mmd_type,
         "mmd_schedule": args.mmd_schedule,
+        "mmd_start_ratio": args.mmd_start_ratio,
         "mmd_warmup_ratio": args.mmd_warmup_ratio,
         "mmd_hold_ratio": args.mmd_hold_ratio,
         "mmd_confidence_gate": args.mmd_confidence_gate,
@@ -884,6 +933,15 @@ def run(args):
         "sca_mu_warmup_ratio": args.sca_mu_warmup_ratio,
         "resgca_geo_tau": args.resgca_geo_tau,
         "resgca_geo_weight": args.resgca_geo_weight,
+        "uot_epsilon": args.uot_epsilon,
+        "uot_tau_s": args.uot_tau_s,
+        "uot_tau_t": args.uot_tau_t,
+        "uot_route_tau": args.uot_route_tau,
+        "uot_n_iter": args.uot_n_iter,
+        "hut_geo_cost_weight": args.hut_geo_cost_weight,
+        "hut_agreement_tau": args.hut_agreement_tau,
+        "hut_use_agreement_mass": getattr(args, "hut_use_agreement_mass", True),
+        "hut_use_geometry_cost": getattr(args, "hut_use_geometry_cost", True),
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -1271,6 +1329,7 @@ def run(args):
         "lambda_min": args.lambda_min,
         "mmd_type": args.mmd_type,
         "mmd_schedule": args.mmd_schedule,
+        "mmd_start_ratio": args.mmd_start_ratio,
         "mmd_warmup_ratio": args.mmd_warmup_ratio,
         "mmd_hold_ratio": args.mmd_hold_ratio,
         "mmd_confidence_gate": args.mmd_confidence_gate,
@@ -1280,6 +1339,15 @@ def run(args):
         "sca_mu_warmup_ratio": args.sca_mu_warmup_ratio,
         "resgca_geo_tau": args.resgca_geo_tau,
         "resgca_geo_weight": args.resgca_geo_weight,
+        "uot_epsilon": args.uot_epsilon,
+        "uot_tau_s": args.uot_tau_s,
+        "uot_tau_t": args.uot_tau_t,
+        "uot_route_tau": args.uot_route_tau,
+        "uot_n_iter": args.uot_n_iter,
+        "hut_geo_cost_weight": args.hut_geo_cost_weight,
+        "hut_agreement_tau": args.hut_agreement_tau,
+        "hut_use_agreement_mass": getattr(args, "hut_use_agreement_mass", True),
+        "hut_use_geometry_cost": getattr(args, "hut_use_geometry_cost", True),
         "proto_tau": args.proto_tau,
         "fusion_tau": args.fusion_tau,
         "topk": args.topk,
@@ -1306,9 +1374,11 @@ if __name__ == "__main__":
     parser.set_defaults(epochs=200, batch_size=64, lr=1e-3, sample_length=9, stride=3)
     parser.add_argument("--lambda_max", type=float, default=0.3)
     parser.add_argument("--lambda_min", type=float, default=0.0)
-    parser.add_argument("--mmd_type", type=str, default="marginal", choices=["marginal", "class_aware", "sca", "resgca"])
+    parser.add_argument("--mmd_type", type=str, default="marginal",
+                        choices=["marginal", "class_aware", "sca", "resgca", "hut"])
     parser.add_argument("--mmd_schedule", type=str, default="monotonic",
                         choices=["monotonic", "warmup_hold", "warmup_decay", "warmup_cosine_decay"])
+    parser.add_argument("--mmd_start_ratio", type=float, default=0.0)
     parser.add_argument("--mmd_warmup_ratio", type=float, default=0.2)
     parser.add_argument("--mmd_hold_ratio", type=float, default=0.5)
     parser.add_argument("--mmd_confidence_gate", type=str, default="none",
@@ -1324,6 +1394,24 @@ if __name__ == "__main__":
                         help="temperature for geometry trust in --mmd_type resgca")
     parser.add_argument("--resgca_geo_weight", type=float, default=1.0,
                         help="strength of geometry trust in --mmd_type resgca; 0 disables geometry gating")
+    parser.add_argument("--uot_epsilon", type=float, default=0.05,
+                        help="entropy regularization for --mmd_type hut")
+    parser.add_argument("--uot_tau_s", type=float, default=1.0,
+                        help="source marginal relaxation penalty for --mmd_type hut")
+    parser.add_argument("--uot_tau_t", type=float, default=0.5,
+                        help="target marginal relaxation penalty for --mmd_type hut")
+    parser.add_argument("--uot_route_tau", type=float, default=0.2,
+                        help="target pseudo-label routing temperature for semantic alignment and HUT")
+    parser.add_argument("--uot_n_iter", type=int, default=20,
+                        help="Sinkhorn iterations for --mmd_type hut")
+    parser.add_argument("--hut_geo_cost_weight", type=float, default=0.2,
+                        help="geometry cost weight for --mmd_type hut")
+    parser.add_argument("--hut_agreement_tau", type=float, default=0.5,
+                        help="temperature for semantic-geometric agreement in --mmd_type hut")
+    parser.add_argument("--hut_use_agreement_mass", action="store_true", default=True)
+    parser.add_argument("--no_hut_agreement_mass", action="store_false", dest="hut_use_agreement_mass")
+    parser.add_argument("--hut_use_geometry_cost", action="store_true", default=True)
+    parser.add_argument("--no_hut_geometry_cost", action="store_false", dest="hut_use_geometry_cost")
     parser.add_argument("--proto_tau", type=float, default=0.07)
     parser.add_argument("--fusion_tau", type=float, default=0.5)
     parser.add_argument("--topk", type=int, default=6)

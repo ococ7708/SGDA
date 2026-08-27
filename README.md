@@ -1,237 +1,276 @@
-# SGDA / GeoSem-STDA for EEG Domain Adaptation
+# SGDA / GeoSem-STDA for EEG Emotion Recognition
 
-This repository contains the SGDA-based EEG cross-subject domain adaptation codebase and the current GeoSem-STDA prototype used for DEAP feasibility and ablation experiments.
+This repository contains the SGDA-based cross-subject EEG emotion recognition code and the current **GeoSem-STDA** model.
 
-The current focus is DEAP valence binary classification under a subject-independent domain adaptation protocol.
+The current priority is **best target accuracy** under the senior SGDA protocol. Target labels are used only for epoch-wise evaluation, and each subject result reports the best target epoch.
 
-## Current New Model
+## Current Complete Model
 
-The new model is tentatively named **GeoSem-STDA sparse reliability**.
+The unified model is implemented in:
 
-Main files:
+```text
+models/geosem_stda.py
+experiments/crossSubject_geosem_stda_sgda.py
+```
 
-- `models/geosem_stda.py`: GeoSem-STDA model components.
-- `experiments/deap/crossSubject_geosem_stda_deap.py`: DEAP cross-subject experiment script.
-- `experiments/deap/run_geosem_stda_deap_5target_full.ps1`: fixed 5-target full-protocol launcher.
-- `experiments/deap/run_geosem_stda_deap_5target_rsg_cutmix_full.ps1`: fixed 5-target RSG-CutMix launcher.
-- `experiments/deap/run_geosem_stda_deap_5target_sca_full.ps1`: fixed 5-target SCA launcher.
-- `experiments/deap/run_geosem_stda_deap_5target_resgca_full.ps1`: fixed 5-target ReSGCA launcher.
-- `experiments/seediv/crossSubject_geosem_stda_seediv.py`: SEED-IV GeoSem-STDA/ReSGCA cross-subject experiment script.
-- `experiments/seediv/run_geosem_stda_seediv_5target_resgca_full.ps1`: fixed 5-target SEED-IV ReSGCA launcher.
-- `docs/GEOSEM_STDA_ABLATION_BRIEF.md`: complete current experiment summary for ablation collaborators.
+The default launchers use the latest stable GeoSem-STDA configuration:
 
-## Model Overview
-
-GeoSem-STDA currently includes:
-
-- SPD covariance construction with shrinkage.
-- Log-Euclidean geometric reference and tangent-space deviation.
+- SPD covariance geometry with shrinkage.
+- Log-Euclidean tangent deviation features.
 - Geometry-guided dynamic graph convolution.
-- Temporal/spatio-temporal EEG encoder.
-- Semantic prototype space with CLIP text vectors.
-- Multi-source adapters.
-- Target-aware sparse source reliability selection.
-- Prototype classification loss and source-target MMD alignment loss.
+- Multi-scale temporal encoder and attention pooling.
+- CLIP semantic text prototypes.
+- Multi-source source-domain adapters.
+- Target-aware sparse reliability source selection.
+- Reliability-guided semantic-geometric conditional alignment (`--mmd_type resgca`).
 
-The multi-source branch is still present, but the current experiment reduces the final training sources from 31 candidate subjects to 6 selected sources for each target subject.
+DEAP also keeps a HUT/RCUOT launcher because the recent DEAP trial used a lighter unbalanced-transport alignment. This is switchable and documented below.
 
-An optional RSG-CutMix module can be enabled with `--use_rsg_cutmix`. It is disabled by default so the existing baseline protocol remains unchanged.
+## Why This Direction
 
-## Data
+Recent EEG emotion recognition work still points to the same useful directions for this project:
 
-Raw and preprocessed EEG datasets are not included in this repository.
+- multi-source domain adaptation and source selection to reduce negative transfer;
+- graph/spatial modeling for EEG channels;
+- class-aware or pseudo-label-aware alignment instead of only marginal MMD.
 
-The DEAP path is configured in:
+Representative recent references:
+
+- [MSGDAN: Multi-source Selective Graph Domain Adaptation Network for cross-subject EEG emotion recognition](https://doi.org/10.1016/j.neunet.2024.106742), Neural Networks 2024.
+- [Spectral-Spatial Attention Alignment for Multi-Source Domain Adaptation in EEG-Based Emotion Recognition](https://ieeexplore.ieee.org/document/10509712/), IEEE Transactions on Affective Computing 2024.
+- [DAPLP: Unsupervised Domain Adaptation With Pseudo-Label Propagation for Cross-Domain EEG Emotion Recognition](https://ieeexplore.ieee.org/document/10944516/), IEEE Transactions on Instrumentation and Measurement 2025.
+- [MS-DCDA: Multi-Source EEG Emotion Recognition via Dynamic Contrastive Domain Adaptation](https://arxiv.org/abs/2408.10235).
+
+Our current model follows these ideas but keeps a different implementation: semantic prototypes + SPD geometry + reliability-guided conditional alignment.
+
+## Data Paths
+
+Datasets are not included in this repository. Set local paths in:
 
 ```text
 data_utils/constants/path_mapper.py
 ```
 
-Collaborators should edit `path_mapper["deap"]` to point to their local DEAP preprocessed directory.
+Required keys:
+
+```python
+path_mapper = {
+    "deap": ".../DEAP/data_preprocessed_python/data_preprocessed_python",
+    "seed_de_lds": ".../SEED/",
+    "seediv_de_lds": ".../SEED_IV/",
+    "seedv_de_lds": ".../SEED_V/",
+    "dreamer": ".../DREAMER/DE_processed_1s.npy",
+}
+```
+
+CLIP text encoder path is configured in:
+
+```text
+data_utils/text_to_vector.py
+```
+
+Current local default:
+
+```text
+D:/大学/脑机接口/local_clip_model
+```
 
 ## Environment
 
-The code was run with a conda environment using PyTorch.
+Use the conda environment with PyTorch:
 
-Minimal packages:
-
-```bash
+```powershell
+conda activate sgda_py311
 pip install -r requirements.txt
 ```
 
-If using CUDA, install the PyTorch build matching your local CUDA version from the official PyTorch installation page.
+For CUDA, install the PyTorch build matching your GPU and CUDA version.
 
-## Reproduce Current 5-Target Experiment
+## SGDA Protocol
 
-PowerShell:
+All launchers below follow the same protocol:
 
-```powershell
-.\experiments\deap\run_geosem_stda_deap_5target_full.ps1
-```
+- Cross-subject leave-one-subject-out within each evaluated session.
+- Target subject data participates in unsupervised adaptation without labels.
+- Target labels are used only for evaluation after each epoch.
+- The main reported metric is `best_acc`.
+- `macro_f1` and `micro_f1` are saved at the same best epoch.
+- Full training uses 200 epochs unless explicitly changed.
 
-Equivalent Python call:
-
-```bash
-python experiments/deap/crossSubject_geosem_stda_deap.py \
-  --target_subject_ids 3 14 20 23 32 \
-  --source_selection sparse_reliability \
-  --epochs 200 \
-  --batch_size 64 \
-  --lr 1e-3 \
-  --reliability_warmup_epochs 5 \
-  --sparse_k_max 6 \
-  --sparse_rho 0.85 \
-  --eval_interval 1 \
-  --log_interval 1 \
-  --lambda_max 0.3 \
-  --proto_tau 0.07 \
-  --fusion_tau 0.5 \
-  --topk 6 \
-  --shrinkage 0.1 \
-  --spd_eps 1e-5 \
-  --geometry_batch_size 256 \
-  --st_dim 128 \
-  --graph_dim 64 \
-  --adapter_bottleneck 32 \
-  --heads 4 \
-  --dropout 0.3 \
-  --weight_decay 1e-4 \
-  --sample_subset stratified
-```
-
-## Current Protocol
-
-- Dataset: DEAP
-- Task: valence binary classification
-- Targets: subjects 3, 14, 20, 23, 32
-- Candidate sources per target: 31
-- Final selected sources per target: 6
-- Epochs: 200
-- Batch size: 64
-- Seed: 42
-
-The current reporting keeps the original senior-code protocol: target evaluation is logged each epoch and the summarized result uses the best target epoch. Final epoch accuracy is kept in `epoch_log.csv` for diagnosis.
-
-## Current Result
-
-For the 5 fixed DEAP target subjects:
+Output is written to:
 
 ```text
-Accuracy = 62.00 +/- 6.75
-Macro-F1 = 61.29 +/- 7.59
-Micro-F1 = 62.00 +/- 6.75
+results/results_<dataset>_geosem_stda/runs/<run_id>/
 ```
 
-Per-target results:
-
-| Target | Candidate Sources | Final Sources | Acc | Macro-F1 | Micro-F1 |
-|---:|---:|---:|---:|---:|---:|
-| S3 | 31 | 6 | 66.67 | 66.52 | 66.67 |
-| S14 | 31 | 6 | 71.11 | 71.00 | 71.11 |
-| S20 | 31 | 6 | 57.50 | 57.26 | 57.50 |
-| S23 | 31 | 6 | 54.72 | 51.77 | 54.72 |
-| S32 | 31 | 6 | 60.00 | 59.90 | 60.00 |
-
-See `docs/GEOSEM_STDA_ABLATION_BRIEF.md` for the complete comparison and recommended next ablations.
-
-## Run RSG-CutMix
-
-PowerShell:
-
-```powershell
-.\experiments\deap\run_geosem_stda_deap_5target_rsg_cutmix_full.ps1
-```
-
-This keeps the same 5-target full protocol and adds the optional reliability-aware semantic-geometric structured EEG CutMix loss.
-
-## Run SCA
-
-PowerShell:
-
-```powershell
-.\experiments\deap\run_geosem_stda_deap_5target_sca_full.ps1
-```
-
-This keeps the same senior 5-target full protocol and replaces marginal MMD with reliability-aware semantic conditional alignment:
+Important files:
 
 ```text
-mmd_type = sca
-mmd_schedule = warmup_cosine_decay
-mmd_confidence_gate = entropy
-lambda_max = 0.2
-lambda_min = 0.05
+epoch_log.csv
+subject_results_<dataset>_geosem_stda.csv
+run_config.json
 ```
 
-See `docs/SCA_MODEL_DESIGN.md` for the theoretical motivation and dataset suitability judgment.
+## Direct Full Runs
 
-## Run ReSGCA
+Run from the repository root after activating conda.
 
-PowerShell:
+### DEAP
 
 ```powershell
-.\experiments\deap\run_geosem_stda_deap_5target_resgca_full.ps1
+.\experiments\deap\run_geosem_stda_deap_sgda_full.ps1
 ```
 
-This keeps the same senior 5-target full protocol and uses reliability-guided semantic-geometric conditional alignment:
+Default DEAP setting:
 
 ```text
+task = valence binary classification
+sample_length = 9
+stride = 3
+epochs = 200
+batch_size = 64
+mmd_type = hut
+lambda_max = 0.02
+final selected sources = Top-6 reliability sources
+```
+
+### SEED
+
+```powershell
+.\experiments\seed\run_geosem_stda_seed_sgda_full.ps1
+```
+
+Default SEED setting:
+
+```text
+sessions = 1, 2, 3
+classes = 3
+sample_length = 3
+stride = 1
+epochs = 200
+batch_size = 128
 mmd_type = resgca
-mmd_schedule = warmup_cosine_decay
-mmd_confidence_gate = entropy
-lambda_max = 0.2
-lambda_min = 0.05
-resgca_geo_tau = 1.0
-resgca_geo_weight = 1.0
+final selected sources = Top-6 reliability sources
 ```
 
-See `docs/ReSGCA_MODEL_DESIGN.md` for the model formulation, ablation chain, and dataset suitability judgment.
-
-## Run SEED-IV ReSGCA
-
-Quick smoke test:
+### SEED-IV
 
 ```powershell
-.\experiments\seediv\run_geosem_stda_seediv_smoke.ps1
+.\experiments\seediv\run_geosem_stda_seediv_sgda_full.ps1
 ```
 
-Fixed 5-target SEED-IV run:
-
-```powershell
-.\experiments\seediv\run_geosem_stda_seediv_5target_resgca_full.ps1
-```
-
-The SEED-IV script uses 4 semantic emotion classes, 62 channels, subject-wise z-score normalization, sparse reliability source selection, and streaming Log-Euclidean geometry construction to reduce GPU memory pressure.
-
-## Run MMD Experiments
-
-The MMD experiments keep the senior target-best reporting protocol unchanged.
-
-Lambda ablation:
-
-```powershell
-.\experiments\deap\run_geosem_stda_deap_5target_mmd_lambda_ablation.ps1
-```
-
-This runs:
+Default SEED-IV setting:
 
 ```text
-lambda_max = 0.0, 0.05, 0.1, 0.2, 0.3
-mmd_type = marginal
-mmd_schedule = monotonic
+sessions = 1, 2, 3
+classes = 4
+sample_length = 3
+stride = 1
+epochs = 200
+batch_size = 64
+mmd_type = resgca
+final selected sources = Top-6 reliability sources
 ```
 
-Recommended class-aware scheduled MMD:
+### SEED-V
 
 ```powershell
-.\experiments\deap\run_geosem_stda_deap_5target_classaware_mmd_full.ps1
+.\experiments\seedv\run_geosem_stda_seedv_sgda_full.ps1
 ```
 
-This runs:
+Default SEED-V setting:
 
 ```text
-mmd_type = class_aware
-mmd_schedule = warmup_decay
-lambda_max = 0.2
-lambda_min = 0.05
-mmd_confidence_gate = soft
+sessions = 1, 2, 3
+classes = 5
+sample_length = 3
+stride = 1
+epochs = 200
+batch_size = 64
+mmd_type = resgca
+final selected sources = Top-6 reliability sources
 ```
+
+The unified script reshapes SEED-V flat features from `[L, 310]` to `[L, 62, 5]` before model input.
+
+### DREAMER
+
+```powershell
+.\experiments\dreamer\run_geosem_stda_dreamer_sgda_full.ps1
+```
+
+Default DREAMER setting:
+
+```text
+session = 1
+task = valence binary classification
+sample_length = 3
+stride = 1
+epochs = 200
+batch_size = 64
+mmd_type = resgca
+dreamer_ea = true
+final selected sources = Top-6 reliability sources
+```
+
+For arousal:
+
+```powershell
+python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --dreamer_labeltype aro
+```
+
+## Smoke Test
+
+Before running all subjects, run one subject for a few epochs:
+
+```powershell
+python experiments\crossSubject_geosem_stda_sgda.py `
+  --dataset_name seediv `
+  --session_ids 1 `
+  --target_subject_ids 1 `
+  --epochs 3 `
+  --reliability_warmup_epochs 1 `
+  --sparse_k_max 3
+```
+
+If this succeeds, run the corresponding full `.ps1` script.
+
+## Useful Switches
+
+Use the default `.ps1` scripts for the main experiment. Change these only for ablation or comparison.
+
+| Purpose | Parameter |
+|---|---|
+| Run fixed target subjects | `--target_subject_ids 1 4 7 10 13` |
+| Run one session | `--session_ids 1` |
+| Random target subset | `--random_target_count 5 --target_seed 42` |
+| Disable source selection | `--source_selection none` |
+| Use class-aware MMD | `--mmd_type class_aware` |
+| Use ReSGCA | `--mmd_type resgca` |
+| Use HUT/RCUOT | `--mmd_type hut --uot_epsilon 0.10 --uot_tau_t 0.7 --uot_n_iter 12 --no_hut_agreement_mass` |
+| Evaluate by feature centroids | `--eval_classifier senior_feature` |
+| Use reliability fusion in evaluation | `--reliability_fusion` |
+
+## Team Requirements
+
+Group members should:
+
+1. Use the latest `main` branch.
+2. Activate the correct conda environment.
+3. Check `path_mapper.py` before running.
+4. Run one smoke test first.
+5. For formal results, run the dataset `.ps1` script without changing hyperparameters.
+6. Report `best_acc`, `macro_f1`, `micro_f1`, `best_epoch`, and the path to `run_config.json`.
+7. Do not compare results from different `sample_length`, `stride`, source count, or epoch settings as the same protocol.
+
+## Current DEAP Partial Progress
+
+The latest DEAP 15-target protocol has completed these targets:
+
+| Target | best_acc | best_epoch | final_acc |
+|---:|---:|---:|---:|
+| 2 | 44.72% | 51 | 35.28% |
+| 3 | 70.28% | 166 | 64.72% |
+| 6 | 60.42% | 102 | 52.92% |
+
+Current completed-target mean best accuracy is about 58.47%.
