@@ -300,7 +300,16 @@ def _collect_target_embeddings(model, target_loader, device):
 
 
 @torch.no_grad()
-def sparse_reliability_source_selection(model, source_loaders, target_loader, source_ids, text_prototypes, num_classes, args):
+def sparse_reliability_source_selection(
+    model,
+    source_loaders,
+    target_loader,
+    source_ids,
+    text_prototypes,
+    num_classes,
+    args,
+    return_details=False,
+):
     source_z, source_y = _collect_source_embeddings(model, source_loaders, args.device)
     target_z = _collect_target_embeddings(model, target_loader, args.device)
     text_prototypes = torch.nn.functional.normalize(text_prototypes, dim=-1)
@@ -352,6 +361,8 @@ def sparse_reliability_source_selection(model, source_loaders, target_loader, so
             f"score={item['score']:.4f}, marg={item['d_marg']:.4f}, "
             f"cond={item['d_cond']:.4f}, src_acc={item['src_acc_proxy']:.4f}"
         )
+    if return_details:
+        return selected_ids, selected_weights.detach().cpu().tolist(), details
     return selected_ids, selected_weights.detach().cpu().tolist()
 
 

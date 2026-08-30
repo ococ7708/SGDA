@@ -1,0 +1,202 @@
+{
+  "dataset": "dreamer",
+  "task": "val",
+  "selection_method": "unlabeled_log_euclidean_subject_difficulty",
+  "subject_index_base": 1,
+  "n_subjects": 23,
+  "n_pilot": 5,
+  "channels": 14,
+  "num_freq_bands": 5,
+  "sample_length": 3,
+  "stride": 1,
+  "shrinkage": 0.1,
+  "spd_eps": 1e-05,
+  "difficulty_scores": {
+    "1": 2.372741460800171,
+    "2": 2.0177977085113525,
+    "3": 1.7444332838058472,
+    "4": 2.39220929145813,
+    "5": 1.6800223588943481,
+    "6": 1.7990508079528809,
+    "7": 1.9707499742507935,
+    "8": 2.023693799972534,
+    "9": 1.7990391254425049,
+    "10": 2.2044572830200195,
+    "11": 1.9263648986816406,
+    "12": 1.7726553678512573,
+    "13": 2.6619017124176025,
+    "14": 2.030517578125,
+    "15": 2.565567970275879,
+    "16": 2.054614782333374,
+    "17": 1.9153485298156738,
+    "18": 1.817838191986084,
+    "19": 1.937252402305603,
+    "20": 2.276789665222168,
+    "21": 1.9513827562332153,
+    "22": 2.057518243789673,
+    "23": 2.3550703525543213
+  },
+  "difficulty_ranking": [
+    {
+      "rank": 1,
+      "subject_id": 5,
+      "difficulty": 1.6800223588943481
+    },
+    {
+      "rank": 2,
+      "subject_id": 3,
+      "difficulty": 1.7444332838058472
+    },
+    {
+      "rank": 3,
+      "subject_id": 12,
+      "difficulty": 1.7726553678512573
+    },
+    {
+      "rank": 4,
+      "subject_id": 9,
+      "difficulty": 1.7990391254425049
+    },
+    {
+      "rank": 5,
+      "subject_id": 6,
+      "difficulty": 1.7990508079528809
+    },
+    {
+      "rank": 6,
+      "subject_id": 18,
+      "difficulty": 1.817838191986084
+    },
+    {
+      "rank": 7,
+      "subject_id": 17,
+      "difficulty": 1.9153485298156738
+    },
+    {
+      "rank": 8,
+      "subject_id": 11,
+      "difficulty": 1.9263648986816406
+    },
+    {
+      "rank": 9,
+      "subject_id": 19,
+      "difficulty": 1.937252402305603
+    },
+    {
+      "rank": 10,
+      "subject_id": 21,
+      "difficulty": 1.9513827562332153
+    },
+    {
+      "rank": 11,
+      "subject_id": 7,
+      "difficulty": 1.9707499742507935
+    },
+    {
+      "rank": 12,
+      "subject_id": 2,
+      "difficulty": 2.0177977085113525
+    },
+    {
+      "rank": 13,
+      "subject_id": 8,
+      "difficulty": 2.023693799972534
+    },
+    {
+      "rank": 14,
+      "subject_id": 14,
+      "difficulty": 2.030517578125
+    },
+    {
+      "rank": 15,
+      "subject_id": 16,
+      "difficulty": 2.054614782333374
+    },
+    {
+      "rank": 16,
+      "subject_id": 22,
+      "difficulty": 2.057518243789673
+    },
+    {
+      "rank": 17,
+      "subject_id": 10,
+      "difficulty": 2.2044572830200195
+    },
+    {
+      "rank": 18,
+      "subject_id": 20,
+      "difficulty": 2.276789665222168
+    },
+    {
+      "rank": 19,
+      "subject_id": 23,
+      "difficulty": 2.3550703525543213
+    },
+    {
+      "rank": 20,
+      "subject_id": 1,
+      "difficulty": 2.372741460800171
+    },
+    {
+      "rank": 21,
+      "subject_id": 4,
+      "difficulty": 2.39220929145813
+    },
+    {
+      "rank": 22,
+      "subject_id": 15,
+      "difficulty": 2.565567970275879
+    },
+    {
+      "rank": 23,
+      "subject_id": 13,
+      "difficulty": 2.6619017124176025
+    }
+  ],
+  "sorted_subject_ids": [
+    5,
+    3,
+    12,
+    9,
+    6,
+    18,
+    17,
+    11,
+    19,
+    21,
+    7,
+    2,
+    8,
+    14,
+    16,
+    22,
+    10,
+    20,
+    23,
+    1,
+    4,
+    15,
+    13
+  ],
+  "selected_percentiles": [
+    0.1,
+    0.3,
+    0.5,
+    0.7,
+    0.9
+  ],
+  "pilot_subject_ids": [
+    12,
+    11,
+    2,
+    22,
+    4
+  ],
+  "difficulty_levels": {
+    "12": "Easy",
+    "11": "Medium-Easy",
+    "2": "Medium",
+    "22": "Medium-Hard",
+    "4": "Hard"
+  }
+}

@@ -219,6 +219,89 @@ For arousal:
 python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --dreamer_labeltype aro
 ```
 
+## DREAMER Pilot-5 Diagnostic Protocol
+
+This protocol is for checking whether the current GeoSem-STDA alignment modules help DREAMER before launching a full ablation suite. It does not change the senior SGDA evaluation rule: the reported target metric is still the best target epoch accuracy.
+
+### Build the fixed Pilot-5 split
+
+```powershell
+.\experiments\dreamer\build_dreamer_pilot5.ps1
+```
+
+The split is selected without labels, predictions, or accuracy. Each DREAMER subject is represented by a subject-level log-Euclidean SPD center. Difficulty is the average Frobenius distance from one subject center to all other subject centers. The fixed Pilot-5 targets cover geometry difficulty percentiles P10/P30/P50/P70/P90:
+
+| Level | Target subject | Difficulty |
+|---|---:|---:|
+| Easy | 12 | 1.772655 |
+| Medium-Easy | 11 | 1.926365 |
+| Medium | 2 | 2.017798 |
+| Medium-Hard | 22 | 2.057518 |
+| Hard | 4 | 2.392209 |
+
+The saved protocol file is:
+
+```text
+results/pilot_protocol/dreamer_pilot5.json
+```
+
+### Run the smoke test first
+
+```powershell
+.\experiments\dreamer\run_dreamer_pilot5_smoke.ps1
+```
+
+The smoke test runs one Pilot target for two epochs across all four variants. Confirm that losses are finite, P0 alignment loss is zero, Top-6 variants select six sources, the all-source variant selects all 22 source subjects, and all output files are created.
+
+### Run the formal Pilot-5 diagnostics
+
+```powershell
+.\experiments\dreamer\run_dreamer_pilot5_diagnostics.ps1
+```
+
+This runs the same five fixed target subjects for 200 epochs with the same DREAMER hyperparameters as the main protocol.
+
+### Diagnostic variants
+
+| Variant | CLI value | Output folder | Purpose |
+|---|---|---|---|
+| P0 | `proto_only` | `results/dreamer_pilot5/P0_proto_only_top6/` | Prototype-only baseline, Top-6 sources, no domain alignment. |
+| P1 | `conditional` | `results/dreamer_pilot5/P1_conditional_top6/` | Simple class-conditional semantic alignment, Top-6 sources. |
+| P2 | `resgca_topk` | `results/dreamer_pilot5/P2_resgca_top6/` | Current full ReSGCA model, Top-6 reliability sources. |
+| P3 | `resgca_all` | `results/dreamer_pilot5/P3_resgca_all_sources/` | Current full ReSGCA model with all 22 source subjects. |
+
+Each variant folder saves:
+
+```text
+per_subject_results.csv
+summary.json
+training_log.txt
+source_selection.json
+```
+
+The automatic comparison files are:
+
+```text
+results/dreamer_pilot5/pilot5_diagnostic_comparison.csv
+results/dreamer_pilot5/pilot5_diagnostic_deltas.json
+```
+
+Decision rule:
+
+- If P2 is better than P0 and P1, the full reliability-guided semantic-geometric alignment is useful.
+- If P3 is better than P2, Top-6 source pruning may be too aggressive on DREAMER.
+- If P1 is better than P2, the current geometry or reliability gating may be hurting alignment.
+- If P0 is best, DREAMER may benefit more from representation learning and evaluation fusion than from stronger domain alignment.
+
+Single-variant commands are also available:
+
+```powershell
+python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant proto_only
+python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant conditional
+python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant resgca_topk
+python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant resgca_all
+```
+
 ## Smoke Test
 
 Before running all subjects, run one subject for a few epochs:
