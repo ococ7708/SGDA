@@ -240,6 +240,18 @@ RAPID_VARIANTS = {
         "cast_level1": True,
         "cast_variant": "e5_strong_de_full_st",
     },
+    "g0_sgda": {
+        "name": "G0_sgda",
+        "representation_mode": "sgda_clean",
+        "classifier_type": "clip",
+        "sgrad_stage1": True,
+    },
+    "g1_sgda_geo_residual": {
+        "name": "G1_sgda_geo_residual",
+        "representation_mode": "sgda_geo_residual",
+        "classifier_type": "clip",
+        "sgrad_stage1": True,
+    },
 }
 
 RAPID_TARGETS = [12, 2, 4]
@@ -444,6 +456,7 @@ def _apply_rapid_variant(args):
         args.classifier_type = "clip"
         args.cast_level1 = False
         args.cast_variant = None
+        args.sgrad_stage1 = False
         return args
     if args.dataset_name != "dreamer":
         raise ValueError("--rapid_pilot3 is defined for DREAMER only")
@@ -453,6 +466,7 @@ def _apply_rapid_variant(args):
     args.classifier_type = spec["classifier_type"]
     args.cast_level1 = bool(spec.get("cast_level1", False))
     args.cast_variant = spec.get("cast_variant")
+    args.sgrad_stage1 = bool(spec.get("sgrad_stage1", False))
     args.mmd_type = "none"
     args.lambda_max = 0.0
     args.lambda_min = 0.0
@@ -519,15 +533,26 @@ def _make_optimizer_for_run(args, model):
     return optim.Adam(trainable, lr=args.lr, weight_decay=args.weight_decay)
 
 
-def _build_fold_representation_inputs(args, session_data, source_ids, target_sub):
-    if args.representation_mode in ("de_only", "cast_level1"):
+def _build_fold_representation_inputs(
+    args,
+    session_data,
+    source_ids,
+    target_sub,
+    source_subset_indices=None,
+):
+    if args.representation_mode in ("de_only", "cast_level1", "sgda_clean"):
         placeholder = {
             sid: torch.zeros((len(session_data[sid]), 1, 1), dtype=torch.float32)
             for sid in source_ids + [target_sub]
         }
         return placeholder, True
+    geometry_data = session_data
+    if source_subset_indices:
+        geometry_data = list(session_data)
+        for sid, indices in source_subset_indices.items():
+            geometry_data[sid] = np.asarray(session_data[sid])[indices]
     geometry = build_geometry_for_fold(
-        session_data,
+        geometry_data,
         source_ids,
         target_sub,
         args.device,
@@ -556,6 +581,8 @@ def _parameter_breakdown(model):
         "direct_de_encoder_params": _module_parameter_count(model.direct_de_encoder),
         "structured_encoder_params": _module_parameter_count(model.encoder),
         "cast_level1_encoder_params": _module_parameter_count(model.cast_encoder),
+        "sgda_de_encoder_params": _module_parameter_count(model.sgda_de_encoder),
+        "geometric_residual_params": _module_parameter_count(model.geometric_residual),
         "adapters_params": _module_parameter_count(model.adapters),
         "head_prototype_related_params": (
             _module_parameter_count(model.prototype_head)
@@ -653,6 +680,29 @@ def _classification_diagnostics(y_true, y_pred):
         "true_class0_ratio": float((y_true == 0).mean()),
         "true_class1_ratio": float((y_true == 1).mean()),
     }
+
+
+@torch.no_grad()
+def _geometric_residual_diagnostics(model, data_loader, device):
+    if model.geometric_residual is None:
+        return {}
+    totals = {"base_norm": 0.0, "geometry_evidence_norm": 0.0, "geometry_residual_norm": 0.0}
+    count = 0
+    model.eval()
+    for x, r, _ in data_loader:
+        batch_size = x.size(0)
+        model.encode(x.to(device), r.to(device))
+        module = model.geometric_residual
+        totals["base_norm"] += module.last_base_norm * batch_size
+        totals["geometry_evidence_norm"] += module.last_evidence_norm * batch_size
+        totals["geometry_residual_norm"] += module.last_residual_norm * batch_size
+        count += batch_size
+    result = {key: value / max(count, 1) for key, value in totals.items()}
+    result["residual_to_base_norm_ratio"] = (
+        result["geometry_residual_norm"] / max(result["base_norm"], 1e-12)
+    )
+    result["beta"] = model.current_beta()
+    return result
 
 
 def simple_conditional_alignment(
@@ -1013,6 +1063,60 @@ def write_cast_level1_summary(output_dir):
     return json_path, csv_path
 
 
+def write_sgrad_stage1_summary(output_dir):
+    variants = [("G0_sgda", "G0"), ("G1_sgda_geo_residual", "G1")]
+    fields = [
+        "variant", "S12_best_acc", "S2_best_acc", "S4_best_acc",
+        "mean_best_acc", "std_best_acc", "mean_macro_f1", "mean_balanced_accuracy",
+        "mean_recall_class0", "mean_recall_class1", "total_params", "trainable_params",
+    ]
+    aggregate = []
+    for folder, short_name in variants:
+        path = os.path.join(output_dir, folder, "per_subject_results.csv")
+        rows = []
+        if os.path.exists(path):
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        by_target = {int(row["target_subject"]): row for row in rows}
+
+        def values(field):
+            return np.asarray([float(row[field]) for row in rows], dtype=np.float64)
+
+        acc = values("best_acc") if rows else np.asarray([])
+        macro = values("macro_f1_at_best") if rows else np.asarray([])
+        balanced = values("balanced_accuracy") if rows else np.asarray([])
+        recall0 = values("recall_class0") if rows else np.asarray([])
+        recall1 = values("recall_class1") if rows else np.asarray([])
+        aggregate.append({
+            "variant": short_name,
+            "S12_best_acc": by_target.get(12, {}).get("best_acc", ""),
+            "S2_best_acc": by_target.get(2, {}).get("best_acc", ""),
+            "S4_best_acc": by_target.get(4, {}).get("best_acc", ""),
+            "mean_best_acc": float(acc.mean()) if acc.size else "",
+            "std_best_acc": float(acc.std(ddof=1)) if acc.size > 1 else "",
+            "mean_macro_f1": float(macro.mean()) if macro.size else "",
+            "mean_balanced_accuracy": float(balanced.mean()) if balanced.size else "",
+            "mean_recall_class0": float(recall0.mean()) if recall0.size else "",
+            "mean_recall_class1": float(recall1.mean()) if recall1.size else "",
+            "total_params": rows[0]["total_params"] if rows else "",
+            "trainable_params": rows[0]["trainable_params"] if rows else "",
+        })
+    csv_path = os.path.join(output_dir, "sgrad_stage1_summary.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(aggregate)
+    json_path = os.path.join(output_dir, "sgrad_stage1_summary.json")
+    _write_json(json_path, {
+        "protocol": "sgrad_stage1_rapid_pilot3",
+        "targets": RAPID_TARGETS,
+        "selection_metric": "mean_best_accuracy",
+        "variants": aggregate,
+        "summary_csv": csv_path,
+    })
+    return json_path, csv_path
+
+
 def _reshape_seedv_flat_features(data, channels=62, num_freq_bands=5):
     reshaped = []
     for session in data:
@@ -1146,8 +1250,8 @@ def _validate_args(args):
         raise ValueError(f"uot_route_tau must be positive, got {args.uot_route_tau}")
     if args.uot_n_iter <= 0:
         raise ValueError(f"uot_n_iter must be positive, got {args.uot_n_iter}")
-    if args.cast_balanced_screening and not args.cast_level1:
-        raise ValueError("--cast_balanced_screening is valid only for E0-E5 CAST variants")
+    if args.cast_balanced_screening and not (args.cast_level1 or args.sgrad_stage1):
+        raise ValueError("--cast_balanced_screening is valid only for CAST or SGRAD variants")
     if args.cast_balanced_screening and args.cast_samples_per_class <= 0:
         raise ValueError("--cast_samples_per_class must be positive")
     if args.cast_freeze_loaded and not args.cast_pretrained_checkpoint:
@@ -1243,7 +1347,14 @@ def run(args):
         f"lmda{_format_float(args.lambda_max)}_{args.mmd_type}_{args.mmd_schedule}_seed{args.seed}_{timestamp}"
     )
     if args.rapid_pilot3:
-        if args.cast_level1:
+        if args.sgrad_stage1:
+            if args.rapid_smoke_test:
+                rapid_output_name = "dreamer_sgrad_stage1_smoke"
+            elif args.cast_balanced_screening:
+                rapid_output_name = f"dreamer_sgrad_stage1_screening_n{args.cast_samples_per_class}"
+            else:
+                rapid_output_name = "dreamer_sgrad_stage1"
+        elif args.cast_level1:
             if args.rapid_smoke_test:
                 rapid_output_name = "dreamer_cast_level1_smoke"
             elif args.cast_balanced_screening:
@@ -1310,6 +1421,16 @@ def run(args):
                 f"[CAST-L1] Screening uses at most {args.cast_samples_per_class} samples/class/source",
                 training_log_path,
             )
+    if args.sgrad_stage1:
+        _log(f"[SGRAD STEP-1] Variant: {args.rapid_variant}", training_log_path)
+        _log("[SGRAD STEP-1] Strong-DE is the mandatory main path", training_log_path)
+        _log("[SGRAD STEP-1] Alignment, dynamic graph, and temporal modules are disabled", training_log_path)
+        if args.representation_mode == "sgda_geo_residual":
+            _log(
+                "[SGRAD STEP-1] One shared Log-Euclidean reference is fitted from source training data only",
+                training_log_path,
+            )
+            _log("[SGRAD STEP-1] Geometry enters only through a small scalar-gated residual", training_log_path)
 
     run_config = {
         "run_id": run_id,
@@ -1323,6 +1444,7 @@ def run(args):
         "rapid_smoke_test": args.rapid_smoke_test if args.rapid_pilot3 else False,
         "cast_level1": args.cast_level1,
         "cast_variant": args.cast_variant,
+        "sgrad_stage1": args.sgrad_stage1,
         "cast_balanced_screening": args.cast_balanced_screening,
         "cast_samples_per_class": args.cast_samples_per_class if args.cast_balanced_screening else None,
         "cast_pretrained_checkpoint": args.cast_pretrained_checkpoint,
@@ -1341,6 +1463,11 @@ def run(args):
             "Best epoch is selected on target accuracy to remain comparable with the existing Rapid Pilot-3; "
             "this is not a strict held-out model-selection protocol."
         ),
+        "geometry_reference_policy": (
+            "single_shared_source_training_log_euclidean_reference"
+            if args.representation_mode == "sgda_geo_residual" else None
+        ),
+        "geometry_uses_target_labels": False,
         "source_candidate_count_per_target": n_subjects - 1,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -1398,6 +1525,7 @@ def run(args):
         "best_epoch", "acc", "best_acc", "macro_f1", "macro_f1_at_best", "micro_f1", "seed",
         "epochs", "classifier_type", "representation_mode", "cast_variant", "screening_mode", "beta_initial",
         "beta_at_best", "beta_final", "fixed_beta", "total_params", "trainable_params",
+        "geometry_evidence_norm", "geometry_residual_norm", "residual_to_base_norm_ratio",
         "balanced_accuracy", "recall_class0", "recall_class1",
         "TN", "FP", "FN", "TP",
         "predicted_class0_ratio", "predicted_class1_ratio",
@@ -1427,16 +1555,33 @@ def run(args):
             )
             _log(f"{'=' * 64}", training_log_path)
 
-            # DE-only receives a shape-compatible placeholder and never enters the
-            # covariance/SPD/Log-Euclidean geometry builder.
+            source_subset_indices = {}
+            if args.cast_balanced_screening:
+                for sid in source_ids:
+                    indices, manifest = _balanced_source_indices(
+                        label[session_idx][sid], args.cast_samples_per_class, args.seed, sid + 1
+                    )
+                    source_subset_indices[sid] = indices
+                    manifest.update({
+                        "session_idx": session_idx + 1,
+                        "target_subject": target_sub + 1,
+                        "variant": args.rapid_variant,
+                    })
+                    screening_manifest_records.append(manifest)
+
+            # Geometry-free variants receive placeholders. G1 instead fits one
+            # reference from the exact source samples used for this training fold.
             r_by_subject, geometry_bypassed = _build_fold_representation_inputs(
                 args,
                 data[session_idx],
                 source_ids,
                 target_sub,
+                source_subset_indices=source_subset_indices,
             )
-            if args.representation_mode in ("de_only", "cast_level1") and not geometry_bypassed:
-                raise AssertionError("DE-only/CAST unexpectedly invoked structured geometry construction")
+            if args.representation_mode in ("de_only", "cast_level1", "sgda_clean") and not geometry_bypassed:
+                raise AssertionError("Geometry-free representation unexpectedly invoked geometry construction")
+            if args.representation_mode == "sgda_geo_residual" and geometry_bypassed:
+                raise AssertionError("G1 must construct shared-reference geometric evidence")
 
             source_loaders, source_class_weights = [], []
             for sid in source_ids:
@@ -1444,18 +1589,11 @@ def run(args):
                 y_array = np.asarray(label[session_idx][sid]).reshape(-1)
                 r = r_by_subject[sid].float()
                 if args.cast_balanced_screening:
-                    indices, manifest = _balanced_source_indices(
-                        y_array, args.cast_samples_per_class, args.seed, sid + 1
-                    )
+                    indices = source_subset_indices[sid]
                     x_array = x_array[indices]
                     y_array = y_array[indices]
-                    r = r[torch.as_tensor(indices, dtype=torch.long)]
-                    manifest.update({
-                        "session_idx": session_idx + 1,
-                        "target_subject": target_sub + 1,
-                        "variant": args.rapid_variant,
-                    })
-                    screening_manifest_records.append(manifest)
+                    if geometry_bypassed:
+                        r = r[torch.as_tensor(indices, dtype=torch.long)]
                 x = torch.tensor(x_array, dtype=torch.float32)
                 y = torch.tensor(y_array, dtype=torch.long)
                 source_class_weights.append(_compute_class_weights(y_array, num_classes, args.device))
@@ -1589,6 +1727,12 @@ def run(args):
                     raise AssertionError("R4 must have no structured encoder instance or parameters")
             if args.cast_level1 and model.encoder is not None:
                 raise AssertionError("CAST Level-1 must not instantiate the geometry-dependent GeoSem encoder")
+            if args.sgrad_stage1 and model.encoder is not None:
+                raise AssertionError("SGRAD STEP-1 must not instantiate graph/temporal GeoSem modules")
+            if args.representation_mode == "sgda_clean" and model.geometric_residual is not None:
+                raise AssertionError("G0 must not contain geometric residual parameters")
+            if args.representation_mode == "sgda_geo_residual" and model.geometric_residual is None:
+                raise AssertionError("G1 geometric residual module is missing")
             if run_config["total_params"] is None:
                 run_config["total_params"] = total_params
                 run_config["trainable_params"] = trainable_params
@@ -1603,6 +1747,8 @@ def run(args):
                 f"direct={parameter_breakdown['direct_de_encoder_params']:,}, "
                 f"structured={parameter_breakdown['structured_encoder_params']:,}, "
                 f"cast_level1={parameter_breakdown['cast_level1_encoder_params']:,}, "
+                f"sgda_de={parameter_breakdown['sgda_de_encoder_params']:,}, "
+                f"geo_residual={parameter_breakdown['geometric_residual_params']:,}, "
                 f"adapters={parameter_breakdown['adapters_params']:,}, "
                 f"head={parameter_breakdown['head_prototype_related_params']:,}, "
                 f"fusion={parameter_breakdown['fusion_params']:,}",
@@ -1718,13 +1864,10 @@ def run(args):
                                 raise AssertionError(f"R4 DE-only representation shape mismatch: {shapes}, expected={expected}")
                             if model.encoder is not None:
                                 raise AssertionError("R4 must not instantiate the structured GeoSem encoder")
-                        elif args.representation_mode != "geosem":
+                        elif args.representation_mode == "cast_level1":
                             expected = (x_src_list[-1].size(0), args.st_dim)
-                            if shapes["h_de"] != expected or (
-                                args.representation_mode != "cast_level1" and shapes["h_struct"] != expected
-                            ):
+                            if shapes["h_de"] != expected:
                                 raise AssertionError(f"Rapid representation shape mismatch: {shapes}, expected={expected}")
-                        if args.representation_mode == "cast_level1":
                             if shapes["h_fused"] != expected:
                                 raise AssertionError(f"CAST output shape mismatch: {shapes}, expected={expected}")
                             cast_grads = [
@@ -1733,6 +1876,18 @@ def run(args):
                             ]
                             if not cast_grads or not all(torch.isfinite(g).all() for g in cast_grads):
                                 raise AssertionError("CAST trainable gradients are missing or non-finite")
+                        elif args.representation_mode in ("sgda_clean", "sgda_geo_residual"):
+                            expected = (x_src_list[-1].size(0), args.st_dim)
+                            if shapes["h_de"] != expected or shapes["h_fused"] != expected:
+                                raise AssertionError(f"SGRAD representation shape mismatch: {shapes}")
+                            if args.representation_mode == "sgda_clean" and shapes["h_struct"] is not None:
+                                raise AssertionError("G0 unexpectedly produced geometric features")
+                            if args.representation_mode == "sgda_geo_residual":
+                                if shapes["h_struct"] != expected:
+                                    raise AssertionError(f"G1 geometry feature shape mismatch: {shapes}")
+                                grad = model.geometric_residual.beta_logit.grad
+                                if grad is None or not torch.isfinite(grad).all():
+                                    raise AssertionError("G1 beta_logit gradient is missing or non-finite")
                         if args.representation_mode == "de_gated":
                             grad = model.residual_fusion.beta_logit.grad
                             if grad is None or not torch.isfinite(grad).all():
@@ -1801,11 +1956,15 @@ def run(args):
                     if acc > best_acc:
                         best_acc, best_macro, best_micro = acc, macro_f1, micro_f1
                         best_epoch = epoch + 1
-                        if args.representation_mode == "de_only" or args.cast_level1:
+                        if args.representation_mode == "de_only" or args.cast_level1 or args.sgrad_stage1:
                             best_diagnostics = _classification_diagnostics(y_true, y_pred)
+                            best_diagnostics.update(
+                                _geometric_residual_diagnostics(model, target_eval_loader, args.device)
+                            )
                         beta_at_best = (
                             model.current_beta()
-                            if args.representation_mode == "de_gated" or args.cast_variant == "e5_strong_de_full_st"
+                            if args.representation_mode in ("de_gated", "sgda_geo_residual")
+                            or args.cast_variant == "e5_strong_de_full_st"
                             else np.nan
                         )
                         _log(f"  >> New best acc: {best_acc:.4f} (epoch {best_epoch})", training_log_path)
@@ -1909,6 +2068,9 @@ def run(args):
                 "fixed_beta": 1.0 if args.representation_mode == "de_residual" else np.nan,
                 "total_params": total_params,
                 "trainable_params": trainable_params,
+                "geometry_evidence_norm": diagnostics.get("geometry_evidence_norm", np.nan),
+                "geometry_residual_norm": diagnostics.get("geometry_residual_norm", np.nan),
+                "residual_to_base_norm_ratio": diagnostics.get("residual_to_base_norm_ratio", np.nan),
                 "balanced_accuracy": diagnostics["balanced_accuracy"],
                 "recall_class0": diagnostics["recall_class0"],
                 "recall_class1": diagnostics["recall_class1"],
@@ -1922,7 +2084,7 @@ def run(args):
                 "final_macro_f1": final_macro,
             }
             subject_records.append(subject_record)
-            if args.representation_mode == "de_only" or args.cast_level1:
+            if args.representation_mode == "de_only" or args.cast_level1 or args.sgrad_stage1:
                 diagnostics_payload = {
                     "target_subject": target_subject_1based,
                     "variant": args.rapid_variant,
@@ -1955,6 +2117,7 @@ def run(args):
         "rapid_variant": args.rapid_variant if args.rapid_pilot3 else None,
         "cast_level1": args.cast_level1,
         "cast_variant": args.cast_variant,
+        "sgrad_stage1": args.sgrad_stage1,
         "screening_mode": args.cast_balanced_screening,
         "representation_mode": args.representation_mode,
         "classifier_type": args.classifier_type,
@@ -1995,17 +2158,18 @@ def run(args):
         "mean_best_epoch": float(np.asarray([row["best_epoch"] for row in subject_records], dtype=np.float32).mean()),
         "beta_initial": (
             subject_records[0]["beta_initial"]
-            if args.representation_mode == "de_gated" or args.cast_variant == "e5_strong_de_full_st"
+            if args.representation_mode in ("de_gated", "sgda_geo_residual")
+            or args.cast_variant == "e5_strong_de_full_st"
             else None
         ),
         "beta_at_best_by_subject": {
             str(row["target_subject"]): row["beta_at_best"]
             for row in subject_records
-        } if args.representation_mode == "de_gated" or args.cast_variant == "e5_strong_de_full_st" else {},
+        } if args.representation_mode in ("de_gated", "sgda_geo_residual") or args.cast_variant == "e5_strong_de_full_st" else {},
         "beta_final_by_subject": {
             str(row["target_subject"]): row["beta_final"]
             for row in subject_records
-        } if args.representation_mode == "de_gated" or args.cast_variant == "e5_strong_de_full_st" else {},
+        } if args.representation_mode in ("de_gated", "sgda_geo_residual") or args.cast_variant == "e5_strong_de_full_st" else {},
         "total_params": run_config["total_params"],
         "trainable_params": run_config["trainable_params"],
         "subject_results_csv": subject_csv,
@@ -2059,7 +2223,10 @@ def run(args):
                 })
             summary["r4_summary_csv"] = r4_summary_path
         _write_json(summary_json_path, summary)
-        if args.cast_level1:
+        if args.sgrad_stage1:
+            rapid_summary_path, rapid_summary_csv = write_sgrad_stage1_summary(output_dir)
+            comparison_path = rapid_summary_csv
+        elif args.cast_level1:
             rapid_summary_path, rapid_summary_csv = write_cast_level1_summary(output_dir)
             comparison_path = rapid_summary_csv
         else:

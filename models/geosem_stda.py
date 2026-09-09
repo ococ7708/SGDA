@@ -83,6 +83,19 @@ def vech(x):
     return x[..., rows, cols]
 
 
+def symmetric_frobenius_vector(x):
+    """Vectorize a symmetric matrix while preserving its Frobenius inner product."""
+    channels = x.size(-1)
+    rows, cols = torch.triu_indices(channels, channels, device=x.device)
+    values = x[..., rows, cols]
+    scale = torch.where(
+        rows == cols,
+        torch.ones_like(rows, dtype=x.dtype),
+        torch.full_like(rows, math.sqrt(2.0), dtype=x.dtype),
+    )
+    return values * scale
+
+
 class AttentionAdjacency(nn.Module):
     def __init__(self, dim, heads=4):
         super().__init__()
@@ -537,6 +550,44 @@ class CASTLevel1Encoder(nn.Module):
         return h
 
 
+class GeometricEvidenceResidual(nn.Module):
+    """Project shared-reference tangent relations and add them as gated evidence."""
+
+    def __init__(self, channels, dim=128, dropout=0.3, beta_initial=0.1):
+        super().__init__()
+        tangent_dim = channels * (channels + 1) // 2
+        self.project = nn.Sequential(
+            nn.LayerNorm(tangent_dim),
+            nn.Linear(tangent_dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, dim),
+        )
+        self.fusion_norm = nn.LayerNorm(dim)
+        beta_logit = math.log(beta_initial / (1.0 - beta_initial))
+        self.beta_logit = nn.Parameter(torch.tensor(beta_logit, dtype=torch.float32))
+        self.last_evidence_norm = None
+        self.last_residual_norm = None
+        self.last_base_norm = None
+
+    @property
+    def beta(self):
+        return torch.sigmoid(self.beta_logit)
+
+    def forward(self, h_de, tangent_deviation_matrix):
+        if tangent_deviation_matrix.dim() != 3:
+            raise ValueError(
+                "Geometric residual expects shared-reference tangent matrices [B,C,C], "
+                f"got {tuple(tangent_deviation_matrix.shape)}"
+            )
+        g_geo = self.project(symmetric_frobenius_vector(tangent_deviation_matrix))
+        residual = self.beta * g_geo
+        self.last_base_norm = float(h_de.detach().norm(dim=-1).mean().cpu())
+        self.last_evidence_norm = float(g_geo.detach().norm(dim=-1).mean().cpu())
+        self.last_residual_norm = float(residual.detach().norm(dim=-1).mean().cpu())
+        return self.fusion_norm(h_de + residual), g_geo
+
+
 class ResidualFusion(nn.Module):
     """Fuse direct DE and structured representations without changing their width."""
 
@@ -602,7 +653,10 @@ class GeoSemSTDA(nn.Module):
         cast_variant=None,
     ):
         super().__init__()
-        if representation_mode not in ("geosem", "de_residual", "de_gated", "de_only", "cast_level1"):
+        if representation_mode not in (
+            "geosem", "de_residual", "de_gated", "de_only", "cast_level1",
+            "sgda_clean", "sgda_geo_residual",
+        ):
             raise ValueError(f"Unsupported representation_mode: {representation_mode}")
         if classifier_type not in ("clip", "linear"):
             raise ValueError(f"Unsupported classifier_type: {classifier_type}")
@@ -610,7 +664,7 @@ class GeoSemSTDA(nn.Module):
         self.representation_mode = representation_mode
         self.classifier_type = classifier_type
         self.encoder = None
-        if representation_mode not in ("de_only", "cast_level1"):
+        if representation_mode not in ("de_only", "cast_level1", "sgda_clean", "sgda_geo_residual"):
             self.encoder = GeoSemEncoder(
                 num_electrodes=num_electrodes,
                 num_freq_bands=num_freq_bands,
@@ -635,17 +689,28 @@ class GeoSemSTDA(nn.Module):
                 dropout=dropout,
                 beta_initial=beta_initial,
             )
+        self.sgda_de_encoder = None
+        if representation_mode in ("sgda_clean", "sgda_geo_residual"):
+            input_dim = int(sample_length) * int(num_electrodes) * int(num_freq_bands)
+            self.sgda_de_encoder = StrongDEEncoder(input_dim, st_dim=st_dim, dropout=dropout)
+        # Created after shared-weight initialization below so G0/G1 common
+        # parameters have identical initialization under the same seed.
+        self.geometric_residual = None
         fusion_mode = {
             "geosem": "none",
             "de_residual": "fixed",
             "de_gated": "gated",
             "de_only": "none",
             "cast_level1": "none",
+            "sgda_clean": "none",
+            "sgda_geo_residual": "none",
         }[representation_mode]
         input_dim = int(sample_length) * int(num_electrodes) * int(num_freq_bands)
         self.direct_de_encoder = (
             DirectDEEncoder(input_dim, st_dim=st_dim, dropout=dropout)
-            if representation_mode not in ("geosem", "cast_level1")
+            if representation_mode not in (
+                "geosem", "cast_level1", "sgda_clean", "sgda_geo_residual"
+            )
             else None
         )
         self.residual_fusion = ResidualFusion(
@@ -661,6 +726,14 @@ class GeoSemSTDA(nn.Module):
         self.linear_head = None
         self.last_representation_shapes = None
         self.apply(self._init_weights)
+        if representation_mode == "sgda_geo_residual":
+            self.geometric_residual = GeometricEvidenceResidual(
+                num_electrodes,
+                dim=st_dim,
+                dropout=dropout,
+                beta_initial=beta_initial,
+            )
+            self.geometric_residual.apply(self._init_weights)
         if classifier_type == "linear":
             # Initialize the R3-only head after all shared modules so R2 and R3
             # have identical shared parameters under the same random seed.
@@ -674,6 +747,19 @@ class GeoSemSTDA(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def encode(self, x, r):
+        if self.representation_mode in ("sgda_clean", "sgda_geo_residual"):
+            h_de = self.sgda_de_encoder(x)
+            if self.geometric_residual is None:
+                h, h_geo = h_de, None
+            else:
+                h, h_geo = self.geometric_residual(h_de, r)
+            self.last_representation_shapes = {
+                "h_de": tuple(h_de.shape),
+                "h_struct": None if h_geo is None else tuple(h_geo.shape),
+                "h_fused": tuple(h.shape),
+                "geometry_input": None if h_geo is None else tuple(r.shape),
+            }
+            return h, None
         if self.representation_mode == "cast_level1":
             h = self.cast_encoder(x)
             flow = self.cast_encoder.last_flow
@@ -703,6 +789,8 @@ class GeoSemSTDA(nn.Module):
         return h, alpha
 
     def current_beta(self):
+        if self.geometric_residual is not None:
+            return float(self.geometric_residual.beta.detach().cpu().item())
         if self.cast_encoder is not None:
             beta = self.cast_encoder.beta
             return None if beta is None else float(beta.detach().cpu().item())
