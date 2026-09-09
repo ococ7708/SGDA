@@ -308,6 +308,278 @@ class PrototypeClassifier(nn.Module):
         return F.normalize(self.proj(h), dim=-1)
 
 
+class DirectDEEncoder(nn.Module):
+    """Minimal direct path that preserves information from flattened DE input."""
+
+    def __init__(self, input_dim, st_dim=128, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, st_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x.flatten(start_dim=1))
+
+
+CAST_LEVEL1_VARIANTS = (
+    "e1_strong_de",
+    "e2_strong_de_channel",
+    "e3_strong_de_channel_graph",
+    "e4_strong_de_channel_graph_multiscale",
+    "e5_strong_de_full_st",
+)
+
+
+class StrongDEEncoder(nn.Module):
+    """R4-compatible direct DE projection plus one residual MLP block."""
+
+    def __init__(self, input_dim, st_dim=128, dropout=0.3):
+        super().__init__()
+        self.input_proj = DirectDEEncoder(input_dim, st_dim=st_dim, dropout=dropout)
+        self.residual_block = nn.Sequential(
+            nn.LayerNorm(st_dim),
+            nn.Linear(st_dim, st_dim * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(st_dim * 2, st_dim),
+            nn.Dropout(dropout),
+        )
+        self.output_norm = nn.LayerNorm(st_dim)
+
+    def forward(self, x):
+        h = self.input_proj(x)
+        return self.output_norm(h + self.residual_block(h))
+
+
+class DynamicChannelSelector(nn.Module):
+    """Sample-dependent channel weighting without electrode coordinates or SPD features."""
+
+    def __init__(self, num_freq_bands, hidden_dim=32):
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(num_freq_bands, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        # Aggregate only over time; retain one score per EEG channel.
+        logits = self.score(x.mean(dim=1)).squeeze(-1)
+        weights = F.softmax(logits, dim=-1)
+        # Mean-one scaling keeps the input magnitude comparable with E1.
+        scaled = x * (weights * x.size(2)).unsqueeze(1).unsqueeze(-1)
+        return scaled, weights
+
+
+class LearnedSparseSpatialGraph(nn.Module):
+    """Learned top-k channel graph built only from DE node features."""
+
+    def __init__(self, num_freq_bands, dim=128, heads=4, topk=6, dropout=0.3):
+        super().__init__()
+        if dim % heads != 0:
+            raise ValueError(f"dim={dim} must be divisible by graph heads={heads}")
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.topk = topk
+        self.node_proj = nn.Linear(num_freq_bands, dim)
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.k = nn.Linear(dim, dim, bias=False)
+        self.message = nn.Linear(dim, dim, bias=False)
+        self.norm = nn.LayerNorm(dim)
+        self.pool_score = nn.Linear(dim, 1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        bsz, steps, channels, _ = x.shape
+        if channels < 2:
+            raise ValueError("LearnedSparseSpatialGraph requires at least two channels")
+        h0 = F.gelu(self.node_proj(x))
+        q = self.q(h0).view(bsz, steps, channels, self.heads, self.head_dim).permute(0, 1, 3, 2, 4)
+        k = self.k(h0).view(bsz, steps, channels, self.heads, self.head_dim).permute(0, 1, 3, 2, 4)
+        logits = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        logits = logits.mean(dim=2)
+        keep = min(max(int(self.topk), 1), channels)
+        top_indices = logits.topk(k=keep, dim=-1).indices
+        mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(-1, top_indices, True)
+        sparse_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+        adjacency = F.softmax(sparse_logits, dim=-1)
+        h = adjacency @ self.message(h0)
+        h = self.norm(h0 + self.dropout(F.gelu(h)))
+        channel_weights = F.softmax(self.pool_score(h).squeeze(-1), dim=-1)
+        spatial_tokens = (channel_weights.unsqueeze(-1) * h).sum(dim=2)
+        return spatial_tokens, adjacency, channel_weights
+
+
+class MultiScaleTemporalContext(nn.Module):
+    """Temporal kernels 3/5/7, learned scale weights, then one MHSA block."""
+
+    def __init__(self, dim=128, heads=4, dropout=0.3, kernels=(3, 5, 7)):
+        super().__init__()
+        self.convs = nn.ModuleList(
+            nn.Conv1d(dim, dim, kernel_size=k, padding=k // 2) for k in kernels
+        )
+        self.scale_logits = nn.Parameter(torch.zeros(len(kernels)))
+        self.conv_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.attn_norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, spatial_tokens):
+        conv_input = spatial_tokens.transpose(1, 2)
+        scales = torch.stack(
+            [F.gelu(conv(conv_input)).transpose(1, 2) for conv in self.convs], dim=2
+        )
+        scale_weights = F.softmax(self.scale_logits, dim=0)
+        h = (scales * scale_weights.view(1, 1, -1, 1)).sum(dim=2)
+        h = self.conv_norm(spatial_tokens + self.dropout(h))
+        context, _ = self.attn(h, h, h, need_weights=False)
+        return self.attn_norm(h + self.dropout(context)), scale_weights
+
+
+class CASTLevel1Encoder(nn.Module):
+    """Incremental CAST-EEG Level-1 encoder with no geometry/alignment dependency."""
+
+    def __init__(
+        self,
+        variant,
+        sample_length,
+        num_electrodes,
+        num_freq_bands,
+        st_dim=128,
+        heads=4,
+        graph_heads=4,
+        topk=6,
+        dropout=0.3,
+        beta_initial=0.1,
+    ):
+        super().__init__()
+        if variant not in CAST_LEVEL1_VARIANTS:
+            raise ValueError(f"Unsupported CAST Level-1 variant: {variant}")
+        self.variant = variant
+        self.level = CAST_LEVEL1_VARIANTS.index(variant) + 1
+        input_dim = int(sample_length) * int(num_electrodes) * int(num_freq_bands)
+        self.strong_de = StrongDEEncoder(input_dim, st_dim=st_dim, dropout=dropout)
+        self.channel_selector = (
+            DynamicChannelSelector(num_freq_bands) if self.level >= 2 else None
+        )
+        self.spatial_graph = (
+            LearnedSparseSpatialGraph(
+                num_freq_bands,
+                dim=st_dim,
+                heads=graph_heads,
+                topk=topk,
+                dropout=dropout,
+            )
+            if self.level >= 3 else None
+        )
+        self.temporal = (
+            MultiScaleTemporalContext(st_dim, heads=heads, dropout=dropout)
+            if self.level >= 4 else None
+        )
+        self.cross_attn = (
+            CrossAttentionBlock(st_dim, heads=heads, dropout=dropout)
+            if self.level >= 5 else None
+        )
+        self.simple_fusion_norm = nn.LayerNorm(st_dim) if self.level in (3, 4) else None
+        self.gated_fusion_norm = nn.LayerNorm(st_dim) if self.level >= 5 else None
+        if self.level >= 5:
+            beta_logit = math.log(beta_initial / (1.0 - beta_initial))
+            self.beta_logit = nn.Parameter(torch.tensor(beta_logit, dtype=torch.float32))
+        else:
+            self.register_parameter("beta_logit", None)
+        self.last_flow = None
+
+    @property
+    def beta(self):
+        return torch.sigmoid(self.beta_logit) if self.beta_logit is not None else None
+
+    def forward(self, x):
+        x_selected = x
+        channel_weights = None
+        if self.channel_selector is not None:
+            x_selected, channel_weights = self.channel_selector(x)
+        h_base = self.strong_de(x_selected)
+
+        spatial_tokens = adjacency = spatial_channel_weights = None
+        temporal_tokens = scale_weights = cross_tokens = None
+        if self.spatial_graph is not None:
+            spatial_tokens, adjacency, spatial_channel_weights = self.spatial_graph(x_selected)
+        if self.temporal is not None:
+            temporal_tokens, scale_weights = self.temporal(spatial_tokens)
+
+        if self.level <= 2:
+            h = h_base
+        elif self.level == 3:
+            h = self.simple_fusion_norm(h_base + spatial_tokens.mean(dim=1))
+        elif self.level == 4:
+            h = self.simple_fusion_norm(h_base + temporal_tokens.mean(dim=1))
+        else:
+            cross_tokens = self.cross_attn(temporal_tokens, spatial_tokens)
+            h = self.gated_fusion_norm(h_base + self.beta * cross_tokens.mean(dim=1))
+
+        self.last_flow = {
+            "input": tuple(x.shape),
+            "channel_weights": None if channel_weights is None else tuple(channel_weights.shape),
+            "h_base": tuple(h_base.shape),
+            "spatial_tokens": None if spatial_tokens is None else tuple(spatial_tokens.shape),
+            "adjacency": None if adjacency is None else tuple(adjacency.shape),
+            "spatial_channel_weights": (
+                None if spatial_channel_weights is None else tuple(spatial_channel_weights.shape)
+            ),
+            "temporal_tokens": None if temporal_tokens is None else tuple(temporal_tokens.shape),
+            "scale_weights": None if scale_weights is None else tuple(scale_weights.shape),
+            "cross_tokens": None if cross_tokens is None else tuple(cross_tokens.shape),
+            "output": tuple(h.shape),
+        }
+        return h
+
+
+class ResidualFusion(nn.Module):
+    """Fuse direct DE and structured representations without changing their width."""
+
+    def __init__(self, dim=128, mode="none", beta_initial=0.1):
+        super().__init__()
+        if mode not in ("none", "fixed", "gated"):
+            raise ValueError(f"Unsupported residual fusion mode: {mode}")
+        if not 0.0 < beta_initial < 1.0:
+            raise ValueError(f"beta_initial must be in (0, 1), got {beta_initial}")
+        self.mode = mode
+        self.norm = nn.LayerNorm(dim) if mode != "none" else nn.Identity()
+        if mode == "gated":
+            beta_logit = math.log(beta_initial / (1.0 - beta_initial))
+            self.beta_logit = nn.Parameter(torch.tensor(beta_logit, dtype=torch.float32))
+        else:
+            self.register_parameter("beta_logit", None)
+
+    @property
+    def beta(self):
+        if self.mode == "fixed":
+            return 1.0
+        if self.mode == "gated":
+            return torch.sigmoid(self.beta_logit)
+        return None
+
+    def forward(self, h_de, h_struct):
+        if self.mode == "none":
+            return h_struct
+        if h_de is None:
+            raise ValueError(f"h_de is required for residual fusion mode={self.mode}")
+        beta = 1.0 if self.mode == "fixed" else torch.sigmoid(self.beta_logit)
+        return self.norm(h_de + beta * h_struct)
+
+
+class LinearClassifier(nn.Module):
+    def __init__(self, text_dim=512, num_classes=2):
+        super().__init__()
+        self.linear = nn.Linear(text_dim, num_classes)
+
+    def forward(self, z):
+        return self.linear(z)
+
+
 class GeoSemSTDA(nn.Module):
     def __init__(
         self,
@@ -322,25 +594,78 @@ class GeoSemSTDA(nn.Module):
         graph_heads=None,
         topk=6,
         dropout=0.3,
+        sample_length=3,
+        representation_mode="geosem",
+        classifier_type="clip",
+        num_classes=2,
+        beta_initial=0.1,
+        cast_variant=None,
     ):
         super().__init__()
+        if representation_mode not in ("geosem", "de_residual", "de_gated", "de_only", "cast_level1"):
+            raise ValueError(f"Unsupported representation_mode: {representation_mode}")
+        if classifier_type not in ("clip", "linear"):
+            raise ValueError(f"Unsupported classifier_type: {classifier_type}")
         self.n_sources = n_sources
-        self.encoder = GeoSemEncoder(
-            num_electrodes=num_electrodes,
-            num_freq_bands=num_freq_bands,
-            graph_dim=graph_dim,
-            st_dim=st_dim,
-            heads=heads,
-            graph_heads=graph_heads,
-            topk=topk,
-            dropout=dropout,
+        self.representation_mode = representation_mode
+        self.classifier_type = classifier_type
+        self.encoder = None
+        if representation_mode not in ("de_only", "cast_level1"):
+            self.encoder = GeoSemEncoder(
+                num_electrodes=num_electrodes,
+                num_freq_bands=num_freq_bands,
+                graph_dim=graph_dim,
+                st_dim=st_dim,
+                heads=heads,
+                graph_heads=graph_heads,
+                topk=topk,
+                dropout=dropout,
+            )
+        self.cast_encoder = None
+        if representation_mode == "cast_level1":
+            self.cast_encoder = CASTLevel1Encoder(
+                variant=cast_variant,
+                sample_length=sample_length,
+                num_electrodes=num_electrodes,
+                num_freq_bands=num_freq_bands,
+                st_dim=st_dim,
+                heads=heads,
+                graph_heads=graph_heads if graph_heads is not None else heads,
+                topk=topk,
+                dropout=dropout,
+                beta_initial=beta_initial,
+            )
+        fusion_mode = {
+            "geosem": "none",
+            "de_residual": "fixed",
+            "de_gated": "gated",
+            "de_only": "none",
+            "cast_level1": "none",
+        }[representation_mode]
+        input_dim = int(sample_length) * int(num_electrodes) * int(num_freq_bands)
+        self.direct_de_encoder = (
+            DirectDEEncoder(input_dim, st_dim=st_dim, dropout=dropout)
+            if representation_mode not in ("geosem", "cast_level1")
+            else None
+        )
+        self.residual_fusion = ResidualFusion(
+            dim=st_dim,
+            mode=fusion_mode,
+            beta_initial=beta_initial,
         )
         self.adapters = nn.ModuleList([
             BottleneckAdapter(st_dim, adapter_bottleneck, dropout)
             for _ in range(n_sources)
         ])
         self.prototype_head = PrototypeClassifier(st_dim, text_dim)
+        self.linear_head = None
+        self.last_representation_shapes = None
         self.apply(self._init_weights)
+        if classifier_type == "linear":
+            # Initialize the R3-only head after all shared modules so R2 and R3
+            # have identical shared parameters under the same random seed.
+            self.linear_head = LinearClassifier(text_dim=text_dim, num_classes=num_classes)
+            self.linear_head.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -349,12 +674,49 @@ class GeoSemSTDA(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def encode(self, x, r):
-        return self.encoder(x, r)
+        if self.representation_mode == "cast_level1":
+            h = self.cast_encoder(x)
+            flow = self.cast_encoder.last_flow
+            self.last_representation_shapes = {
+                "h_de": flow["h_base"],
+                "h_struct": flow["cross_tokens"] or flow["temporal_tokens"] or flow["spatial_tokens"],
+                "h_fused": flow["output"],
+                "cast_flow": flow,
+            }
+            return h, None
+        if self.representation_mode == "de_only":
+            h_de = self.direct_de_encoder(x)
+            self.last_representation_shapes = {
+                "h_de": tuple(h_de.shape),
+                "h_struct": None,
+                "h_fused": tuple(h_de.shape),
+            }
+            return h_de, None
+        h_struct, alpha = self.encoder(x, r)
+        h_de = self.direct_de_encoder(x) if self.direct_de_encoder is not None else None
+        h = self.residual_fusion(h_de, h_struct)
+        self.last_representation_shapes = {
+            "h_de": None if h_de is None else tuple(h_de.shape),
+            "h_struct": tuple(h_struct.shape),
+            "h_fused": tuple(h.shape),
+        }
+        return h, alpha
+
+    def current_beta(self):
+        if self.cast_encoder is not None:
+            beta = self.cast_encoder.beta
+            return None if beta is None else float(beta.detach().cpu().item())
+        beta = self.residual_fusion.beta
+        if beta is None:
+            return None
+        if torch.is_tensor(beta):
+            return float(beta.detach().cpu().item())
+        return float(beta)
 
     def project_all_adapters(self, h):
         return [self.prototype_head(adapter(h)) for adapter in self.adapters]
 
-    def forward(self, x_src_list, r_src_list, x_tgt, r_tgt, return_features=False):
+    def forward(self, x_src_list, r_src_list, x_tgt=None, r_tgt=None, return_features=False):
         z_src_all = []
         h_src_list = []
         alpha_src_list = []
@@ -363,11 +725,17 @@ class GeoSemSTDA(nn.Module):
             for i, (x_src, r_src) in enumerate(zip(x_src_list, r_src_list)):
                 h_src, alpha_src = self.encode(x_src, r_src)
                 h_src_list.append(h_src)
-                alpha_src_list.append(alpha_src)
+                if alpha_src is not None:
+                    alpha_src_list.append(alpha_src)
                 z_src_all.append(self.prototype_head(self.adapters[i](h_src)))
 
-        h_tgt, alpha_tgt = self.encode(x_tgt, r_tgt)
-        z_tgt_all = self.project_all_adapters(h_tgt)
+        if x_tgt is not None:
+            if r_tgt is None:
+                raise ValueError("r_tgt is required when x_tgt is provided")
+            h_tgt, alpha_tgt = self.encode(x_tgt, r_tgt)
+            z_tgt_all = self.project_all_adapters(h_tgt)
+        else:
+            h_tgt, alpha_tgt, z_tgt_all = None, None, []
 
         if return_features:
             return z_src_all, z_tgt_all, h_src_list, h_tgt, alpha_src_list, alpha_tgt
@@ -398,6 +766,26 @@ def prototype_contrastive_loss(
     for z, labels, class_weights in zip(z_src_all, y_src_list, class_weights_list):
         logits = z @ text_prototypes.T / tau
         losses.append(F.cross_entropy(logits, labels, weight=class_weights))
+    losses = torch.stack(losses)
+    weights = _normalize_source_weights(source_weights, len(losses), losses.device)
+    return (weights * losses).sum()
+
+
+def linear_classification_loss(
+    z_src_all,
+    y_src_list,
+    linear_head,
+    class_weights_list=None,
+    source_weights=None,
+):
+    """Shared supervised linear-head loss across all source adapters."""
+    if linear_head is None:
+        raise ValueError("linear_head is required for linear classification loss")
+    losses = []
+    if class_weights_list is None:
+        class_weights_list = [None] * len(z_src_all)
+    for z, labels, class_weights in zip(z_src_all, y_src_list, class_weights_list):
+        losses.append(F.cross_entropy(linear_head(z), labels, weight=class_weights))
     losses = torch.stack(losses)
     weights = _normalize_source_weights(source_weights, len(losses), losses.device)
     return (weights * losses).sum()
@@ -785,10 +1173,16 @@ def predict_class_aware(model, dataloader, text_prototypes, source_class_centroi
                         eval_classifier="text", centroid_blend=0.5,
                         source_domain_centroids=None,
                         source_reliability_weights=None,
-                        reliability_fusion=False):
+                        reliability_fusion=False,
+                        classifier_type=None):
     model.eval()
-    text_prototypes = F.normalize(text_prototypes.to(device), dim=-1)
-    source_class_centroids = source_class_centroids.to(device)
+    classifier_type = model.classifier_type if classifier_type is None else str(classifier_type).lower()
+    if classifier_type not in ("clip", "linear"):
+        raise ValueError(f"Unsupported classifier_type: {classifier_type}")
+    if classifier_type == "clip":
+        text_prototypes = F.normalize(text_prototypes.to(device), dim=-1)
+    if source_class_centroids is not None:
+        source_class_centroids = source_class_centroids.to(device)
     eval_classifier = str(eval_classifier).lower()
     centroid_blend = float(min(max(centroid_blend, 0.0), 1.0))
     y_true, y_pred = [], []
@@ -798,22 +1192,7 @@ def predict_class_aware(model, dataloader, text_prototypes, source_class_centroi
         rb = rb.to(device)
         _, z_tgt_all = model([], [], xb, rb)
         z_stack = torch.stack(z_tgt_all, dim=0)  # [K, B, D]
-        logits = z_stack @ text_prototypes.T / proto_tau
-        probs = F.softmax(logits, dim=-1)
-        sims_to_centroids = torch.einsum("kbd,kcd->kbc", z_stack, source_class_centroids)
-        expected_dist = (probs * (1.0 - sims_to_centroids)).sum(dim=-1)
-        weights = F.softmax(-expected_dist / fusion_tau, dim=0).unsqueeze(-1)
-        z_fused = F.normalize((weights * z_stack).sum(dim=0), dim=-1)
-        text_logits = z_fused @ text_prototypes.T
-        centroid_logits = (weights * sims_to_centroids).sum(dim=0)
-
-        if eval_classifier == "text":
-            logits_eval = text_logits
-        elif eval_classifier == "centroid":
-            logits_eval = centroid_logits
-        elif eval_classifier == "hybrid":
-            logits_eval = (1.0 - centroid_blend) * text_logits + centroid_blend * centroid_logits
-        elif eval_classifier == "senior_feature":
+        if eval_classifier == "senior_feature":
             if source_domain_centroids is None:
                 raise ValueError("source_domain_centroids is required for senior_feature evaluation")
             source_domain_centroids = source_domain_centroids.to(device)
@@ -832,9 +1211,33 @@ def predict_class_aware(model, dataloader, text_prototypes, source_class_centroi
                 domain_logits = domain_logits + prior.log().unsqueeze(-1)
             domain_weights = F.softmax(domain_logits, dim=0).unsqueeze(-1)
             z_senior = F.normalize((domain_weights * z_stack).sum(dim=0), dim=-1)
-            logits_eval = z_senior @ text_prototypes.T
+            if classifier_type == "linear":
+                if model.linear_head is None:
+                    raise ValueError("Model has no linear_head for linear classification")
+                logits_eval = model.linear_head(z_senior)
+            else:
+                logits_eval = z_senior @ text_prototypes.T
         else:
-            raise ValueError(f"Unsupported eval_classifier: {eval_classifier}")
+            if classifier_type == "linear":
+                raise ValueError("Linear classification requires classifier-independent senior_feature fusion")
+            if source_class_centroids is None:
+                raise ValueError(f"source_class_centroids is required for {eval_classifier} evaluation")
+            logits = z_stack @ text_prototypes.T / proto_tau
+            probs = F.softmax(logits, dim=-1)
+            sims_to_centroids = torch.einsum("kbd,kcd->kbc", z_stack, source_class_centroids)
+            expected_dist = (probs * (1.0 - sims_to_centroids)).sum(dim=-1)
+            weights = F.softmax(-expected_dist / fusion_tau, dim=0).unsqueeze(-1)
+            z_fused = F.normalize((weights * z_stack).sum(dim=0), dim=-1)
+            text_logits = z_fused @ text_prototypes.T
+            centroid_logits = (weights * sims_to_centroids).sum(dim=0)
+            if eval_classifier == "text":
+                logits_eval = text_logits
+            elif eval_classifier == "centroid":
+                logits_eval = centroid_logits
+            elif eval_classifier == "hybrid":
+                logits_eval = (1.0 - centroid_blend) * text_logits + centroid_blend * centroid_logits
+            else:
+                raise ValueError(f"Unsupported eval_classifier: {eval_classifier}")
 
         pred = logits_eval.argmax(dim=-1)
         y_true.append(yb.cpu().numpy())
