@@ -27,7 +27,7 @@ DREAMER 输入为 `[B,3,14,5]`。E1–E5 最终表征均为 `[B,128]`，经 6 �
 
 - `CAST L1 00 Smoke E5`
 - `CAST L1 10 Screen E0` 至 `CAST L1 15 Screen E5`
-- `CAST L1 20 Full E5`
+- `CAST L1 20 Full E0` 至 `CAST L1 25 Full E5`
 - 原有的 `Rapid Pilot-3 R0` 至 `Rapid Pilot-3 R4` 保持不变
 
 在 PyCharm 右上角运行配置下拉框选择对应项目，再点击绿色三角或按 `Shift+F10` 即可。不要直接对编辑器里的任意 Python 文件按运行；应确认右上角显示的是上述命名配置。
