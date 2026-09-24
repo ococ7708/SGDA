@@ -4,11 +4,11 @@ from pathlib import Path
 import numpy as np
 
 ROOT=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(ROOT))
-from utils.seediv_c1_c2_protocol import canonical_hash, load_config
+from utils.seediv_c1_c2_protocol import canonical_hash, load_config, resolve_c1_config
 
 
 def main(config_path, allow_partial):
-    cfg=load_config(config_path); root=ROOT/"results"/"seediv_c1"/canonical_hash(cfg); rows=[]; missing=[]
+    cfg=load_config(config_path); effective=resolve_c1_config(cfg); root=ROOT/"results"/"seediv_c1"/canonical_hash(effective); rows=[]; missing=[]
     for variant in cfg["variants"]:
         for seed in cfg["seeds"]:
             for session in (1,2,3):

@@ -197,7 +197,9 @@ class AffectiveMetricHead(nn.Module):
         base = z @ self.prototypes.T / self.tau
         zero = base.new_zeros(())
         if self.variant == "E0":
-            return C1Output(base, zero, None, {"centered_logit_rms": zero})
+            return C1Output(base, zero, None, {
+                "centered_logit_rms": zero, "prediction_flip_rate": zero,
+            })
         if self.metric_generator is not None:
             raw = self.metric_generator(context)
             bounded = bound_symmetric(raw, self.gamma, self.bound_eps)
@@ -230,33 +232,67 @@ class AffectiveMetricHead(nn.Module):
 
 
 class MultiSourceAffectiveMetric(nn.Module):
-    """Independent isomorphic C1 heads, one for every source expert branch."""
+    """Independent per-source heads or one explicitly shared C1 head."""
 
-    def __init__(self, n_sources: int, **head_kwargs):
+    def __init__(self, n_sources: int, head_sharing: str = "independent", **head_kwargs):
         super().__init__()
-        self.heads = nn.ModuleList([AffectiveMetricHead(**head_kwargs) for _ in range(n_sources)])
+        if head_sharing not in ("independent", "shared"):
+            raise ValueError("head_sharing must be independent or shared")
+        self.n_sources = int(n_sources)
+        self.head_sharing = head_sharing
+        count = self.n_sources if head_sharing == "independent" else 1
+        self.heads = nn.ModuleList([AffectiveMetricHead(**head_kwargs) for _ in range(count)])
+
+    def _branch_heads(self):
+        return list(self.heads) if self.head_sharing == "independent" else [self.heads[0]] * self.n_sources
 
     def source_outputs(self, contexts: list[torch.Tensor], embeddings: list[torch.Tensor]) -> list[C1Output]:
-        if len(contexts) != len(self.heads) or len(embeddings) != len(self.heads):
+        if len(contexts) != self.n_sources or len(embeddings) != self.n_sources:
             raise ValueError("source contexts/embeddings must match the number of C1 heads")
-        return [head(context, embedding) for head, context, embedding in zip(self.heads, contexts, embeddings)]
+        return [head(context, embedding) for head, context, embedding in zip(self._branch_heads(), contexts, embeddings)]
 
     def fused_output(
         self, context: torch.Tensor, embeddings: list[torch.Tensor], source_weights: torch.Tensor,
+        fusion_mode: str = "branch_logits",
     ) -> C1Output:
-        """Preserve original feature fusion and fuse branch mechanisms with the same weights."""
+        """Fuse branch scores by default, matching how every branch head is trained.
+
+        ``legacy_fused_embedding`` is retained only for an explicitly registered
+        ablation; it sends the same fused embedding through all branch heads.
+        """
         stack = torch.stack(embeddings, dim=0)  # [K,N,D]
         if source_weights.shape != stack.shape[:2]:
             raise ValueError("source_weights must be [K,N]")
         fused_z = F.normalize((source_weights[..., None] * stack).sum(dim=0), dim=-1)
-        outputs = [head(context, fused_z) for head in self.heads]
-        logits = (source_weights[..., None] * torch.stack([o.logits for o in outputs])).sum(0)
+        if fusion_mode == "branch_logits":
+            outputs = [head(context, embedding) for head, embedding in zip(self._branch_heads(), embeddings)]
+        elif fusion_mode == "shared_fused_embedding":
+            if self.head_sharing != "shared":
+                raise ValueError("shared_fused_embedding requires head_sharing=shared")
+            outputs = [self.heads[0](context, fused_z)]
+        elif fusion_mode == "legacy_fused_embedding":
+            outputs = [head(context, fused_z) for head in self._branch_heads()]
+        else:
+            raise ValueError(f"unsupported C1 fusion_mode: {fusion_mode}")
+        logits = outputs[0].logits if fusion_mode == "shared_fused_embedding" else (
+            source_weights[..., None] * torch.stack([o.logits for o in outputs])
+        ).sum(0)
         regularization = torch.stack([o.regularization for o in outputs]).mean()
         relations = [o.relation for o in outputs if o.relation is not None]
-        relation = None if not relations else (
-            source_weights.T[..., None, None] * torch.stack(relations, dim=1)
-        ).sum(1)
-        return C1Output(logits, regularization, relation, {
+        if not relations:
+            relation = None
+        elif fusion_mode == "shared_fused_embedding":
+            relation = relations[0]
+        else:
+            relation = (source_weights.T[..., None, None] * torch.stack(relations, dim=1)).sum(1)
+        diagnostics = {
             "centered_logit_rms": torch.stack([o.diagnostics["centered_logit_rms"] for o in outputs]).mean(),
+            "prediction_flip_rate": torch.stack([o.diagnostics["prediction_flip_rate"] for o in outputs]).mean(),
             "fused_embedding": fused_z,
-        })
+            "fusion_mode": fusion_mode,
+        }
+        h_fro = [o.diagnostics["H_fro"].mean() for o in outputs if "H_fro" in o.diagnostics]
+        h_var = [o.diagnostics["H_sample_variance"] for o in outputs if "H_sample_variance" in o.diagnostics]
+        diagnostics["metric_H_fro_mean"] = logits.new_zeros(()) if not h_fro else torch.stack(h_fro).mean()
+        diagnostics["metric_H_sample_variance"] = logits.new_zeros(()) if not h_var else torch.stack(h_var).mean()
+        return C1Output(logits, regularization, relation, diagnostics)

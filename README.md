@@ -1,6 +1,6 @@
 # SGDA / GeoSem-STDA for EEG Emotion Recognition
 
-> **2026-09-24 Task 06（当前执行入口）**：C1/C2 模型代码、验收命令、三人分工和结果交付规范见 [docs/C1_C2_TEAM_HANDOFF.md](docs/C1_C2_TEAM_HANDOFF.md)。原始 SGDA 实验文件保持不改；正式实验必须使用冻结配置并保存逐 fold 证据，不能只提交最终均值。
+> **2026-09-24 Task 06（当前执行入口）**：C1 模型与训练入口、C2 基础组件、验收命令、三人分工和结果交付规范见 [docs/C1_C2_TEAM_HANDOFF.md](docs/C1_C2_TEAM_HANDOFF.md)。C2 正式 OOF/V/U 流水线尚未完成，不得将基础组件写成完整验证。原始 SGDA 实验文件保持不改；正式实验必须使用冻结后的 effective config 并保存逐 fold 证据，不能只提交最终均值。
 
 This repository contains the SGDA-based cross-subject EEG emotion recognition code and the current **GeoSem-STDA** model.
 

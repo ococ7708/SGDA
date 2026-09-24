@@ -11,9 +11,10 @@ def main(a):
     variants = a.variants.split(",") if a.variants else config["variants"]
     seeds = [int(x) for x in (a.seeds.split(",") if a.seeds else config["seeds"])]
     targets = [int(x) for x in (a.targets.split(",") if a.targets else range(1, 16))]
-    from utils.seediv_c1_c2_protocol import canonical_hash
+    from utils.seediv_c1_c2_protocol import canonical_hash, resolve_c1_config
+    effective_config = resolve_c1_config(config, smoke=a.smoke)
     family = "seediv_c1_smoke" if a.smoke else "seediv_c1"
-    base = ROOT / "results" / family / canonical_hash(config)
+    base = ROOT / "results" / family / canonical_hash(effective_config)
     for variant in variants:
         for seed in seeds:
             for target in targets:

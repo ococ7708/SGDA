@@ -1,12 +1,12 @@
 import torch
 
 from models.context_affective_metric import (
-    AffectiveMetricHead, bound_symmetric, low_rank_metric_scores, random_basis,
+    AffectiveMetricHead, MultiSourceAffectiveMetric, bound_symmetric, low_rank_metric_scores, random_basis,
 )
 from utils.pairwise_consistency import (
     apply_best_single_action, apply_multi_pair_actions, pairwise_residuals, utility_labels,
 )
-from utils.seediv_c1_c2_protocol import oof_plan, source_roles
+from utils.seediv_c1_c2_protocol import canonical_hash, oof_plan, resolve_c1_config, source_roles
 
 
 def test_low_rank_matches_dense():
@@ -77,3 +77,22 @@ def test_subject_isolation():
     assert not (set(roles["T"]) & set(roles["V"]) | set(roles["T"]) & set(roles["U"]))
     for row in oof_plan(roles["T"]):
         assert row["held_out"] not in row["teacher_train"]
+
+
+def test_branch_first_fusion_and_effective_config_hash():
+    torch.manual_seed(11)
+    prototypes=torch.randn(4,10); basis=random_basis(10,2,5)
+    module=MultiSourceAffectiveMetric(2,variant="E0",context_dim=6,prototypes=prototypes,basis=basis)
+    context=torch.randn(3,6); embeddings=[torch.randn(3,10),torch.randn(3,10)]
+    weights=torch.tensor([[.8,.2,.5],[.2,.8,.5]])
+    output=module.fused_output(context,embeddings,weights,"branch_logits")
+    branches=module.source_outputs([context,context],embeddings)
+    expected=(weights[...,None]*torch.stack([x.logits for x in branches])).sum(0)
+    assert torch.allclose(output.logits,expected)
+    shared=MultiSourceAffectiveMetric(2,head_sharing="shared",variant="E2",context_dim=6,prototypes=prototypes,basis=basis)
+    shared_output=shared.fused_output(context,embeddings,weights,"shared_fused_embedding")
+    assert shared_output.logits.shape==(3,4) and len(shared.heads)==1
+    base={"epochs":200,"batch_size":64,"learning_rate":1e-3}
+    first=resolve_c1_config(base,{"learning_rate":2e-3})
+    second=resolve_c1_config(base,{"learning_rate":3e-3})
+    assert first["learning_rate"]==2e-3 and canonical_hash(first)!=canonical_hash(second)

@@ -4,7 +4,7 @@
 
 - 已实现 C1 的 E0–E5 数学头、低秩度量、共同平面旋转和多源分支融合。
 - 已实现端到端 SEED-IV C1 训练入口、目标 best checkpoint、同 checkpoint 的 Accuracy/Macro-F1/Balanced Accuracy/recall/confusion matrix。
-- 已实现 C2 pairwise residual、真实 CE utility label、U1/U2 一致性求解、共享 MLP router 和 OOF provenance 强校验训练入口。
+- 已实现 C2 pairwise residual、真实 CE utility label、U1/U2 一致性求解、共享 MLP router 和 OOF 声明校验训练入口。**C2 目前只是基础组件及证据包消费者，不是完整正式实验流水线**：尚未自动训练 OOF teachers、完成 V/U 选择评价及全部对照；声明校验也不能替代 checkpoint 级独立审计。
 - 原文件 `experiments/seediv/crossSubjects_seediv.py` 未修改。原 SGDA 结果须单列，不能与 C1 文件互相覆盖。
 - 数学单元测试 4/4 通过；synthetic C1/C2 acceptance smoke 通过。尚未代替真实 EEG 首 fold smoke，也未运行 200-epoch 正式实验。
 
@@ -56,9 +56,21 @@ python analysis/summarize_c1_results.py --allow-partial
 
 总负责人收齐三份后，去掉 `--allow-partial`；缺任何计划 cell 时汇总程序会失败，不会把不完整结果冒充完整实验。
 
+## C1 接口消融（与默认主表分开）
+
+默认配置是“独立度量头 + 各分支先打分再融合 logits”。共享度量对照使用独立配置，训练时直接监督 uniform fused source representation，目标推理时使用距离权重融合表示：
+
+```powershell
+python experiments/seediv_c1_end_to_end.py --config configs/seediv_c1_shared_fused.json --variant E2 --session 1 --target 1 --seed 42 --device cuda:0 --smoke
+```
+
+共享配置与默认配置具有不同 effective-config hash，结果不可覆盖或拼接。`tau` 是类别 logits 温度，`fusion_tau` 是源权重温度，两者必须分别报告。共享度量不自动代表概率已校准。
+
 ## C2 的交付边界
 
 C2 必须在固定 9-fold 开发协议上，以 subject-level OOF teacher 生成 evidence package。窗口随机切分不合格。每个 `.npz` 必须配套 provenance JSON，列出每个 `held_out` 与 `teacher_train`；`seediv_c2_utility.py` 会拒绝 teacher 看过 held-out subject 的包。
+
+注意：当前检查只能验证 provenance 文件中的集合声明自洽，不能独立证明 teacher checkpoint 的真实训练数据。正式 C2 还需要自动 OOF teacher 训练、checkpoint/训练样本 hash 绑定、V 选模/U 终评、逐轮完整系统 best 保存，以及置信度、距离和普通 MoE 对照；完成这些之前不得写“C2 正式验证完成”。
 
 C2 每 fold 至少交付：reference/expert logits、真实标签及 sample/session/subject/trial/window ID、source distance、prototype pair feature、OOF provenance、router checkpoint、Q0–Q3/U1/U2 的 CE/Accuracy/Macro-F1/BA、负迁移率和动作率。C2 正式 45-fold 只有在任务书开发门槛通过后才启动。
 
