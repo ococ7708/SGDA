@@ -1,0 +1,17 @@
+{
+  "schema_version": "task06-v1",
+  "dataset": "SEED-IV DE-LDS",
+  "protocol": "P-I cross-subject single-session LOSO; 3 sessions x 15 targets; activate only after C2 development gate",
+  "variants": ["Q0", "Q1", "Q2", "Q3", "U1", "U2"],
+  "seeds": [42, 43, 44],
+  "epochs": 100,
+  "batch_size": 256,
+  "learning_rate": 0.001,
+  "alpha": 0.25,
+  "residual_clip": 2.0,
+  "router_hidden": [64, 32],
+  "teacher_provenance": "subject-level OOF only",
+  "activation_gate": "C2 development: mean U CE reduction > 0; >=6/9 non-worse; mean accuracy non-decrease; beats preselected deployable baseline",
+  "target_labels_used_for_training": false,
+  "best_checkpoint_rule": "target_best_accuracy_same_checkpoint_metrics"
+}

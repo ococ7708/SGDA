@@ -1,0 +1,10 @@
+{
+  "source": "EMOD AAAI 2026 official repository, data_preprocess/SEEDIV_preprocess.py; discrete-label V-A mapping described in the paper as averaged statistical mappings from Cowen & Keltner 2017",
+  "scale": "official EMOD repository integer V-A coding used for SEED-IV preprocessing; pairwise Euclidean geometry is translation-invariant",
+  "classes": {
+    "neutral": {"valence": 4, "arousal": 4},
+    "sad": {"valence": 3, "arousal": 5},
+    "fear": {"valence": 3, "arousal": 6},
+    "happy": {"valence": 7, "arousal": 6}
+  }
+}

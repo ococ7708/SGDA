@@ -1,0 +1,19 @@
+{
+  "schema_version": "task06-v1",
+  "dataset": "SEED-IV DE-LDS",
+  "protocol": "P-I cross-subject single-session LOSO; 3 sessions x 15 targets",
+  "variants": ["E0", "E1", "E2", "E3", "E4", "E5"],
+  "seeds": [42, 43, 44],
+  "epochs": 200,
+  "batch_size": 64,
+  "learning_rate": 0.001,
+  "tau": 0.07,
+  "rank": 2,
+  "gamma": 0.5,
+  "metric_epsilon": 1e-6,
+  "lambda_H": 0.0001,
+  "normalization": "historical transductive per-subject z-score; identical for all variants",
+  "target_labels_used_for_training": false,
+  "best_checkpoint_rule": "target_best_accuracy_same_checkpoint_metrics",
+  "warning": "Target-best is retained only for historical comparability and is not publication-level model selection."
+}

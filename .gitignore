@@ -20,6 +20,7 @@ env/
 
 # Experiment outputs and checkpoints
 results/
+artifacts/
 runs/
 checkpoints/
 *.pt

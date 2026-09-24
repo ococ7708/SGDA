@@ -1,0 +1,17 @@
+{
+  "schema_version": "task06-v1",
+  "dataset": "SEED-IV DE-LDS",
+  "protocol": "development targets S1/S6/S11 per session; source T8/V3/U3",
+  "variants": ["Q0", "Q1", "Q2", "Q3", "U1", "U2"],
+  "seeds": [42],
+  "epochs": 100,
+  "batch_size": 256,
+  "learning_rate": 0.001,
+  "alpha": 0.25,
+  "residual_clip": 2.0,
+  "router_hidden": [64, 32],
+  "source_split_seed": 20260924,
+  "teacher_provenance": "subject-level OOF only",
+  "target_labels_used_for_training": false,
+  "best_checkpoint_rule": "target_best_accuracy_same_checkpoint_metrics"
+}
