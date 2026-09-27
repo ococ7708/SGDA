@@ -4,6 +4,8 @@
 
 > **2026-09-27 C1 部分结果**：Session 1–2 已完成并核验 540/810 runs。Session 3 收到的90个 seed-42 runs 属于修复前哈希 `bd6c9b46c9db30ae`，未合并，仍需按正式哈希 `592351bfb649e601` 重跑270个 runs。核心表、被试级配对统计、证据边界和论文表述建议见 [docs/C1_PARTIAL_RESULTS_FOR_GPT.md](docs/C1_PARTIAL_RESULTS_FOR_GPT.md)，机器可读表见 [docs/c1_partial_tables/](docs/c1_partial_tables/)，旧批次审计见 [docs/C1_GROUP_C_SESSION3_LEGACY_INTAKE.md](docs/C1_GROUP_C_SESSION3_LEGACY_INTAKE.md)。这些是 target-best 部分结果，不能称为完整 C1 主表或独立测试集结论。可用 `analysis/c1_detailed_summary.py` 从本地 `results/` 重新生成统计表。
 
+> **2026-09-27 C1/C2 Temporal Utility 任务书**：三位组员按方法依次交接，不按 Session 分工。组员 A 负责基线与可行性诊断，组员 B 负责 OOF teacher 和当前窗口 U0，组员 C 负责历史 utility 对照 U1/U2/U2-current。固定 pilot 方案、数据隔离规则、逐人交付物和验收标准见 [docs/C1_C2_Temporal_Utility_Codex_Task.md](docs/C1_C2_Temporal_Utility_Codex_Task.md)。这是待执行的研究设计，不代表新增实验已运行或结果已验证。
+
 This repository contains the SGDA-based cross-subject EEG emotion recognition code and the current **GeoSem-STDA** model.
 
 The current priority is **best target accuracy** under the senior SGDA protocol. Target labels are used only for epoch-wise evaluation, and each subject result reports the best target epoch.
