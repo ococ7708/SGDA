@@ -40,6 +40,9 @@ def resolve_c1_config(config, overrides=None, *, smoke=False):
         if value is not None:
             effective[key] = value
     effective.setdefault("weight_decay", 1e-4)
+    effective.setdefault("metric_lr_multiplier", 1.0)
+    if float(effective["metric_lr_multiplier"]) <= 0:
+        raise ValueError("metric_lr_multiplier must be positive")
     effective.setdefault("fusion_tau", 0.07)
     effective.setdefault("fusion_mode", "branch_logits")
     effective.setdefault("head_sharing", "independent")

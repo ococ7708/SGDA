@@ -1,0 +1,59 @@
+{
+  "schema_version": "seed-seedv-single-session-exploration-v1",
+  "purpose": "Exploratory single-session cross-subject feasibility check; not a confirmatory result",
+  "runner": "experiments/crossSubject_geosem_stda_sgda.py",
+  "model_family": "repository GeoSem-STDA/SGDA cross-subject standard configuration",
+  "protocol": "Within each dataset and selected session separately, leave one subject out; train on all other subjects; evaluate only the held-out subject",
+  "selected_sessions": {
+    "seed": 2,
+    "seedv": 1
+  },
+  "random_seed": 42,
+  "common_settings": {
+    "epochs": 200,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "sample_length": 3,
+    "stride": 1,
+    "source_selection": "sparse_reliability",
+    "mmd_type": "resgca",
+    "mmd_schedule": "warmup_cosine_decay",
+    "lambda_max": 0.2,
+    "lambda_min": 0.05,
+    "classifier_type": "clip",
+    "representation_mode": "geosem"
+  },
+  "datasets": {
+    "seed": {
+      "subjects": 15,
+      "classes": ["negative", "neutral", "positive"],
+      "loader": "data_utils.load_data.get_data; seed DE-LDS",
+      "feature_path_key": "seed_de_lds"
+    },
+    "seedv": {
+      "subjects": 16,
+      "classes": ["disgust", "fear", "sad", "neutral", "happy"],
+      "loader": "data_utils.load_seedv.read_seedv_feature; subject files from unzipped_DE_features",
+      "feature_path_key": "seedv_de_lds"
+    }
+  },
+  "stages": {
+    "smoke": {
+      "targets_per_dataset": [1],
+      "epochs": 2,
+      "interpretation": "Engineering-only; checks data, labels, model dimensions and one LOSO fold"
+    },
+    "single_session_loso": {
+      "targets": "all subjects in the dataset",
+      "epochs": 200,
+      "interpretation": "Future exploratory full LOSO run; do not launch as part of the current code-and-smoke task"
+    }
+  },
+  "metrics": ["accuracy", "macro_f1", "balanced_accuracy", "confusion_matrix", "per_subject_results"],
+  "known_limitations": [
+    "SEED and SEED-V have different label spaces and are analyzed separately; do not pool their scores.",
+    "The shared runner reports epoch-wise target evaluation and historical target-accuracy selection; resulting best-epoch scores are exploratory and optimistic.",
+    "One session cannot establish robustness across sessions. Repeat the frozen protocol on the remaining sessions before making cross-session claims.",
+    "Target-label-driven best-epoch selection is not a publication-grade model-selection protocol; use a source-only validation rule or a fixed final epoch for confirmatory evaluation."
+  ]
+}

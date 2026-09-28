@@ -81,6 +81,18 @@ def semantic_basis(prototypes, va):
     return torch.linalg.qr(directions, mode="reduced").Q[:, :2]
 
 
+def _build_optimizer(model, mechanism, effective_config):
+    """Keep the backbone LR and scale only the C1 metric-mechanism group."""
+    base_lr = float(effective_config["learning_rate"])
+    multiplier = float(effective_config.get("metric_lr_multiplier", 1.0))
+    if multiplier <= 0:
+        raise ValueError("metric_lr_multiplier must be positive")
+    return torch.optim.Adam([
+        {"params": list(model.parameters()), "lr": base_lr, "group_name": "backbone"},
+        {"params": list(mechanism.parameters()), "lr": base_lr * multiplier, "group_name": "mechanism"},
+    ], lr=base_lr, weight_decay=float(effective_config["weight_decay"]))
+
+
 def make_loader(x, y, batch, shuffle, smoke, seed):
     x, y = np.asarray(x, np.float32), np.asarray(y, np.int64).reshape(-1)
     if smoke:
@@ -95,23 +107,44 @@ def evaluate(model, mechanism, loader, centroids, device, fusion_tau=0.07,
     model.eval(); mechanism.eval(); ys, preds, logits_all = [], [], []
     diagnostics = {"centered_logit_rms": [], "prediction_flip_rate": [],
                    "metric_H_fro_mean": [], "metric_H_sample_variance": [],
+                   "metric_H_spectral_norm_mean": [], "metric_H_spectral_norm_max": [],
+                   "metric_H_spectral_ratio_mean": [], "metric_H_spectral_ratio_max": [],
                    "source_weight_entropy": []}
+    base_preds = []
     for x, r, y in loader:
         x, r = x.to(device), r.to(device)
         _, z_all, _, h, _, _ = model([], [], x, r, return_features=True)
         stack = torch.stack(z_all)
         weights = F.softmax(-torch.norm(stack - centroids[:, None], dim=-1) / fusion_tau, dim=0)
         output = mechanism.fused_output(h, z_all, weights, fusion_mode=fusion_mode)
+        base_branch_logits = torch.stack([
+            F.normalize(embedding, dim=-1) @ head.prototypes.T / head.tau
+            for head, embedding in zip(mechanism._branch_heads(), z_all)
+        ])
+        base_fused = (weights[..., None] * base_branch_logits).sum(0)
         for key in diagnostics:
             if key == "source_weight_entropy":
                 value = -(weights * weights.clamp_min(1e-12).log()).sum(0).mean()
             else:
                 value = output.diagnostics[key]
             diagnostics[key].append(float(value.detach().cpu()))
-        ys.append(y.numpy()); preds.append(output.logits.argmax(-1).cpu().numpy()); logits_all.append(output.logits.cpu())
+        ys.append(y.numpy()); preds.append(output.logits.argmax(-1).cpu().numpy())
+        base_preds.append(base_fused.argmax(-1).cpu().numpy()); logits_all.append(output.logits.cpu())
     yt, yp, logits = np.concatenate(ys), np.concatenate(preds), torch.cat(logits_all)
     result = _diagnostics(yt, yp, logits, num_classes)
-    result.update({key: float(np.mean(values)) for key, values in diagnostics.items()})
+    base_pred = np.concatenate(base_preds)
+    corrected = (base_pred != yt) & (yp == yt)
+    harmed = (base_pred == yt) & (yp != yt)
+    result.update({
+        "final_fused_prediction_flip_rate": float((yp != base_pred).mean()),
+        "final_fused_corrected_errors": int(corrected.sum()),
+        "final_fused_harmed_correct": int(harmed.sum()),
+        "final_fused_net_corrections": int(corrected.sum() - harmed.sum()),
+        "final_fused_net_correction_rate": float((corrected.sum() - harmed.sum()) / max(len(yt), 1)),
+        "baseline_cosine_accuracy": float((base_pred == yt).mean()),
+    })
+    for key, values in diagnostics.items():
+        result[key] = float(np.max(values) if key.endswith("_max") else np.mean(values))
     return result
 
 
@@ -119,6 +152,7 @@ def run(args):
     file_config = load_config(args.config)
     effective_config = resolve_c1_config(file_config, {
         "epochs": args.epochs, "batch_size": args.batch_size, "learning_rate": args.lr,
+        "metric_lr_multiplier": args.metric_lr_multiplier,
         "tau": args.tau, "rank": args.rank, "gamma": args.gamma,
         "metric_epsilon": args.metric_epsilon, "lambda_H": args.lambda_h,
         "fusion_tau": args.fusion_tau, "fusion_mode": args.fusion_mode,
@@ -129,6 +163,7 @@ def run(args):
     args.epochs = int(effective_config["epochs"])
     args.batch_size = int(effective_config["batch_size"])
     args.lr = float(effective_config["learning_rate"])
+    args.metric_lr_multiplier = float(effective_config["metric_lr_multiplier"])
     args.va_config = effective_config["va_config"]
     args.sample_length = int(effective_config["sample_length"])
     setup_seed(args.seed)
@@ -163,8 +198,7 @@ def run(args):
         hidden_dim=int(effective_config["metric_hidden_dim"]),
         gamma=float(effective_config["gamma"]), bound_eps=float(effective_config["metric_epsilon"]),
         tau=float(effective_config["tau"]), lambda_regularization=float(effective_config["lambda_H"])).to(device)
-    parameters = list(model.parameters()) + list(mechanism.parameters())
-    optimizer = torch.optim.Adam(parameters, lr=args.lr, weight_decay=float(effective_config["weight_decay"]))
+    optimizer = _build_optimizer(model, mechanism, effective_config)
     result_family = "seediv_c1_smoke" if args.smoke else "seediv_c1"
     effective_hash = canonical_hash(effective_config)
     out = ROOT / "results" / result_family / effective_hash / args.variant / f"seed{args.seed}" / f"session{args.session}_target{args.target:02d}"
@@ -175,6 +209,14 @@ def run(args):
         "target": args.target, "source_ids": [x + 1 for x in source_ids], "device": str(device),
         "B_sem": {"va_config": args.va_config, "method": "centered least-squares V-A to CLIP; QR"},
         "B_used": "B_proto" if args.variant == "E5" else "B_sem", "smoke": args.smoke,
+        "optimizer_param_groups": [
+            {"name": group["group_name"], "lr": float(group["lr"]),
+             "weight_decay": float(optimizer.defaults["weight_decay"])}
+            for group in optimizer.param_groups
+        ],
+        "base_learning_rate": args.lr,
+        "metric_lr_multiplier": args.metric_lr_multiplier,
+        "metric_learning_rate": args.lr * args.metric_lr_multiplier,
         "original_sgda_modified": False}
     (out / "run_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     steps = min(len(x) for x in loaders); best = None
@@ -194,7 +236,9 @@ def run(args):
     epochs = args.epochs
     for epoch in range(start_epoch, epochs + 1):
         model.train(); mechanism.train()
-        gradient_norms = []
+        gradient_norms, metric_head_gradient_norms = [], []
+        train_ce_values, train_regularization_values = [], []
+        train_h_spectral_values, train_h_ratio_values = [], []
         for _ in range(steps):
             batches = []
             for i, iterator in enumerate(iters):
@@ -204,24 +248,39 @@ def run(args):
             optimizer.zero_grad(); z, _, h, _, _, _ = model(xs, rs, return_features=True)
             if effective_config["training_path"] == "branch_supervision":
                 outputs = mechanism.source_outputs(h, z)
-                losses = [F.cross_entropy(o.logits, y, weight=w) + o.regularization
-                          for o, y, w in zip(outputs, ys, weights)]
+                batch_outputs = outputs
+                ce_losses = [F.cross_entropy(o.logits, y, weight=w) for o, y, w in zip(outputs, ys, weights)]
+                regularization_losses = [o.regularization for o in outputs]
             elif effective_config["training_path"] == "fused_uniform_direct":
                 if effective_config["head_sharing"] != "shared":
                     raise ValueError("fused_uniform_direct requires head_sharing=shared")
-                losses = []
+                ce_losses, regularization_losses, batch_outputs = [], [], []
                 for source_h, y, class_weight in zip(h, ys, weights):
                     branch_z = model.project_all_adapters(source_h)
                     uniform = source_h.new_full((len(source_ids), len(source_h)), 1.0 / len(source_ids))
                     output = mechanism.fused_output(source_h, branch_z, uniform, "shared_fused_embedding")
-                    losses.append(F.cross_entropy(output.logits, y, weight=class_weight) + output.regularization)
+                    batch_outputs.append(output)
+                    ce_losses.append(F.cross_entropy(output.logits, y, weight=class_weight))
+                    regularization_losses.append(output.regularization)
             else:
                 raise ValueError(f"unsupported training_path: {effective_config['training_path']}")
-            loss = torch.stack(losses).mean()
+            train_ce_values.append(float(torch.stack(ce_losses).mean().detach().cpu()))
+            train_regularization_values.append(float(torch.stack(regularization_losses).mean().detach().cpu()))
+            spectral_rows = [o.diagnostics["H_spectral_norm"].reshape(-1) for o in batch_outputs
+                if "H_spectral_norm" in o.diagnostics]
+            ratio_rows = [o.diagnostics["H_spectral_ratio"].reshape(-1) for o in batch_outputs
+                if "H_spectral_ratio" in o.diagnostics]
+            train_h_spectral_values.append(float(torch.cat(spectral_rows).mean().detach().cpu()) if spectral_rows else 0.0)
+            train_h_ratio_values.append(float(torch.cat(ratio_rows).mean().detach().cpu()) if ratio_rows else 0.0)
+            loss = torch.stack([ce + reg for ce, reg in zip(ce_losses, regularization_losses)]).mean()
             loss.backward()
             grad_sq = sum(float(parameter.grad.detach().square().sum().cpu())
                           for parameter in mechanism.parameters() if parameter.grad is not None)
             gradient_norms.append(grad_sq ** 0.5)
+            metric_grad_sq = sum(float(parameter.grad.detach().square().sum().cpu())
+                for name, parameter in mechanism.named_parameters()
+                if "metric_generator" in name and parameter.grad is not None)
+            metric_head_gradient_norms.append(metric_grad_sq ** 0.5)
             optimizer.step()
         # no_grad alone does not disable Dropout.  Compute centroids and target
         # features under the same deterministic evaluation-mode distribution.
@@ -233,6 +292,18 @@ def run(args):
             fusion_mode=effective_config["fusion_mode"],
             num_classes=int(effective_config["num_classes"]))
         metrics["mechanism_gradient_norm_mean"] = float(np.mean(gradient_norms)) if gradient_norms else 0.0
+        metrics["mechanism_gradient_norm_max"] = float(np.max(gradient_norms)) if gradient_norms else 0.0
+        metrics["metric_head_gradient_norm_mean"] = float(np.mean(metric_head_gradient_norms)) if metric_head_gradient_norms else 0.0
+        metrics["metric_head_gradient_norm_max"] = float(np.max(metric_head_gradient_norms)) if metric_head_gradient_norms else 0.0
+        metrics["training_ce_mean"] = float(np.mean(train_ce_values)) if train_ce_values else 0.0
+        metrics["training_regularization_mean"] = float(np.mean(train_regularization_values)) if train_regularization_values else 0.0
+        metrics["training_objective_mean"] = metrics["training_ce_mean"] + metrics["training_regularization_mean"]
+        metrics["training_H_spectral_norm_mean"] = float(np.mean(train_h_spectral_values)) if train_h_spectral_values else 0.0
+        metrics["training_H_spectral_norm_max"] = float(np.max(train_h_spectral_values)) if train_h_spectral_values else 0.0
+        metrics["training_H_spectral_ratio_gamma_mean"] = float(np.mean(train_h_ratio_values)) if train_h_ratio_values else 0.0
+        metrics["backbone_learning_rate"] = args.lr
+        metrics["metric_learning_rate"] = args.lr * args.metric_lr_multiplier
+        metrics["metric_lr_multiplier"] = args.metric_lr_multiplier
         record = {**metrics, "best_epoch": epoch, "best_accuracy": metrics["accuracy"]}
         history.append({"epoch": epoch, **metrics})
         if best is None or record["accuracy"] > best["accuracy"]:
@@ -256,6 +327,7 @@ if __name__ == "__main__":
     p.add_argument("--session", type=int, choices=(1,2,3), required=True); p.add_argument("--target", type=int, choices=range(1,16), required=True)
     p.add_argument("--seed", type=int, default=42); p.add_argument("--epochs", type=int); p.add_argument("--batch-size", type=int)
     p.add_argument("--lr", type=float); p.add_argument("--tau", type=float); p.add_argument("--rank", type=int); p.add_argument("--gamma", type=float)
+    p.add_argument("--metric-lr-multiplier", type=float)
     p.add_argument("--metric-epsilon", type=float); p.add_argument("--lambda-h", type=float); p.add_argument("--fusion-tau", type=float)
     p.add_argument("--fusion-mode", choices=("branch_logits", "legacy_fused_embedding"))
     p.add_argument("--device", default="cuda:0"); p.add_argument("--data-load-workers", type=int, default=0)

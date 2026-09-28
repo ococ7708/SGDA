@@ -1,365 +1,122 @@
-# SGDA / GeoSem-STDA for EEG Emotion Recognition
+# SGDA / GeoSem-STDA EEG Emotion Recognition
 
-> **2026-09-24 Task 06（当前执行入口）**：C1 模型与训练入口、C2 基础组件、验收命令、三人分工和结果交付规范见 [docs/C1_C2_TEAM_HANDOFF.md](docs/C1_C2_TEAM_HANDOFF.md)。C2 正式 OOF/V/U 流水线尚未完成，不得将基础组件写成完整验证。原始 SGDA 实验文件保持不改；正式实验必须使用冻结后的 effective config 并保存逐 fold 证据，不能只提交最终均值。
+This repository contains the original SGDA implementation, the GeoSem-STDA research model, and the current SEED-IV C1/C2 experiments. Dataset files and pretrained CLIP weights are not included.
 
-> **2026-09-27 C1 部分结果**：Session 1–2 已完成并核验 540/810 runs。Session 3 收到的90个 seed-42 runs 属于修复前哈希 `bd6c9b46c9db30ae`，未合并，仍需按正式哈希 `592351bfb649e601` 重跑270个 runs。核心表、被试级配对统计、证据边界和论文表述建议见 [docs/C1_PARTIAL_RESULTS_FOR_GPT.md](docs/C1_PARTIAL_RESULTS_FOR_GPT.md)，机器可读表见 [docs/c1_partial_tables/](docs/c1_partial_tables/)，旧批次审计见 [docs/C1_GROUP_C_SESSION3_LEGACY_INTAKE.md](docs/C1_GROUP_C_SESSION3_LEGACY_INTAKE.md)。这些是 target-best 部分结果，不能称为完整 C1 主表或独立测试集结论。可用 `analysis/c1_detailed_summary.py` 从本地 `results/` 重新生成统计表。
+## Active work: C1 metric-learning-rate optimization
 
-> **2026-09-27 C1/C2 Temporal Utility 任务书**：三位组员按方法依次交接，不按 Session 分工。组员 A 负责基线与可行性诊断，组员 B 负责 OOF teacher 和当前窗口 U0，组员 C 负责历史 utility 对照 U1/U2/U2-current。固定 pilot 方案、数据隔离规则、逐人交付物和验收标准见 [docs/C1_C2_Temporal_Utility_Codex_Task.md](docs/C1_C2_Temporal_Utility_Codex_Task.md)。这是待执行的研究设计，不代表新增实验已运行或结果已验证。
+The immediate code task makes one constrained change to C1 E2: `metric_lr_multiplier` scales only the metric-mechanism optimizer group. Backbone LR, model architecture, fusion, rank, temperature, preprocessing, LOSO, training budget, and batch size remain unchanged. The resolved multiplier is included in the effective config and run hash. A uses multiplier 3 / gamma 0.5; B holds multiplier 3 and changes only gamma to 0.25. The formal scope is all three SEED-IV sessions separately, all 15 targets, and seeds 42/43/44 (135 runs per phase). B is gated on A's paired all-session consistency check.
 
-This repository contains the SGDA-based cross-subject EEG emotion recognition code and the current **GeoSem-STDA** model.
+Only smoke tests have been completed for the current all-session config. C1 smoke used target 6 / seed 42 / two epochs in each session; engineering-only accuracies were 0.2500, 0.6250, and 0.2500. The effective config hash was `fcb505a9e03ac832`; run manifests record backbone LR 0.001 and mechanism LR 0.003. These smoke metrics are not efficacy results. A previous A attempt used an earlier config hash: Session 1 / target 6 / seed 42 completed 200 epochs and recorded accuracy 0.3861 versus the paired E2 baseline 0.4807; seed 43 stopped at epoch 71 and seed 44 never started. That partial batch is excluded from the all-session analysis and does not establish a general negative or positive result.
 
-The current priority is **best target accuracy** under the senior SGDA protocol. Target labels are used only for epoch-wise evaluation, and each subject result reports the best target epoch.
-
-## Current Complete Model
-
-The unified model is implemented in:
-
-```text
-models/geosem_stda.py
-experiments/crossSubject_geosem_stda_sgda.py
-```
-
-The default launchers use the latest stable GeoSem-STDA configuration:
-
-- SPD covariance geometry with shrinkage.
-- Log-Euclidean tangent deviation features.
-- Geometry-guided dynamic graph convolution.
-- Multi-scale temporal encoder and attention pooling.
-- CLIP semantic text prototypes.
-- Multi-source source-domain adapters.
-- Target-aware sparse reliability source selection.
-- Reliability-guided semantic-geometric conditional alignment (`--mmd_type resgca`).
-
-DEAP also keeps a HUT/RCUOT launcher because the recent DEAP trial used a lighter unbalanced-transport alignment. This is switchable and documented below.
-
-## Why This Direction
-
-Recent EEG emotion recognition work still points to the same useful directions for this project:
-
-- multi-source domain adaptation and source selection to reduce negative transfer;
-- graph/spatial modeling for EEG channels;
-- class-aware or pseudo-label-aware alignment instead of only marginal MMD.
-
-Representative recent references:
-
-- [MSGDAN: Multi-source Selective Graph Domain Adaptation Network for cross-subject EEG emotion recognition](https://doi.org/10.1016/j.neunet.2024.106742), Neural Networks 2024.
-- [Spectral-Spatial Attention Alignment for Multi-Source Domain Adaptation in EEG-Based Emotion Recognition](https://ieeexplore.ieee.org/document/10509712/), IEEE Transactions on Affective Computing 2024.
-- [DAPLP: Unsupervised Domain Adaptation With Pseudo-Label Propagation for Cross-Domain EEG Emotion Recognition](https://ieeexplore.ieee.org/document/10944516/), IEEE Transactions on Instrumentation and Measurement 2025.
-- [MS-DCDA: Multi-Source EEG Emotion Recognition via Dynamic Contrastive Domain Adaptation](https://arxiv.org/abs/2408.10235).
-
-Our current model follows these ideas but keeps a different implementation: semantic prototypes + SPD geometry + reliability-guided conditional alignment.
-
-## Data Paths
-
-Datasets are not included in this repository. Set local paths in:
-
-```text
-data_utils/constants/path_mapper.py
-```
-
-Required keys:
-
-```python
-path_mapper = {
-    "deap": ".../DEAP/data_preprocessed_python/data_preprocessed_python",
-    "seed_de_lds": ".../SEED/",
-    "seediv_de_lds": ".../SEED_IV/",
-    "seedv_de_lds": ".../SEED_V/",
-    "dreamer": ".../DREAMER/DE_processed_1s.npy",
-}
-```
-
-CLIP text encoder path is configured in:
-
-```text
-data_utils/text_to_vector.py
-```
-
-Current local default:
-
-```text
-D:/大学/脑机接口/local_clip_model
-```
-
-## Environment
-
-Use the conda environment with PyTorch:
+Run just the C1 engineering smoke with:
 
 ```powershell
-conda activate sgda_py311
-pip install -r requirements.txt
+python experiments\run_c1_metric_lr_smoke.py --device cuda:0
 ```
 
-For CUDA, install the PyTorch build matching your GPU and CUDA version.
+The full A/B run has not been launched. Preflight found only 90/135 matching E2 parent folds: all 45 Session 3 E2 parents are missing. The full C1 A phase is blocked until those exact parent checkpoints and metrics are completed and audited. `experiments/run_c1_e2_metric_lr_screen.py` enforces this parent check, then runs a full phase; A must finish and pass its recorded gate before B. Do not infer model performance from smoke runs or the interrupted earlier A batch. Full per-run outputs remain local under `results/` and are not committed.
 
-## SGDA Protocol
+## External single-session smoke: SEED and SEED-V
 
-All launchers below follow the same protocol:
-
-- Cross-subject leave-one-subject-out within each evaluated session.
-- Target subject data participates in unsupervised adaptation without labels.
-- Target labels are used only for evaluation after each epoch.
-- The main reported metric is `best_acc`.
-- `macro_f1` and `micro_f1` are saved at the same best epoch.
-- Full training uses 200 epochs unless explicitly changed.
-
-Output is written to:
-
-```text
-results/results_<dataset>_geosem_stda/runs/<run_id>/
-```
-
-Important files:
-
-```text
-epoch_log.csv
-subject_results_<dataset>_geosem_stda.csv
-run_config.json
-```
-
-## Direct Full Runs
-
-Run from the repository root after activating conda.
-
-### DEAP
+The separately scoped external checks are SEED Session 2 and SEED-V Session 1. Smoke target 1 / seed 42 / two epochs completed for both; the observed accuracies were 0.4923 and 0.3963, respectively, and are engineering-only. Before running on another machine, point `seed_de_lds` and `seedv_de_lds` in `data_utils/constants/path_mapper.py` to that machine's feature directories. To run the smoke:
 
 ```powershell
-.\experiments\deap\run_geosem_stda_deap_sgda_full.ps1
+$env:SGDA_PYTHON = "python"
+.\experiments\run_seed_seedv_session1_exploratory.ps1 -Stage Smoke
 ```
 
-Default DEAP setting:
+The future 15-target SEED Session 2 and 16-target SEED-V Session 1 LOSO runs are deferred and must be launched separately. Keep datasets, class spaces, metrics, and summaries separate. Details and assignments are in [docs/SEED_SEEDV_SINGLE_SESSION_EXPLORATION.md](docs/SEED_SEEDV_SINGLE_SESSION_EXPLORATION.md).
 
-```text
-task = valence binary classification
-sample_length = 9
-stride = 3
-epochs = 200
-batch_size = 64
-mmd_type = hut
-lambda_max = 0.02
-final selected sources = Top-6 reliability sources
-```
+## Immediate three-member assignment
 
-### SEED
+| Member | Task after smoke/code review | Coverage and handoff |
+|---|---|---|
+| A | First close the 45 missing Session 3 E2 parent folds and verify the full 135-cell E2 parent. Then own C1 phase A (`metric_lr_multiplier=3`, `gamma=0.5`) when full execution is scheduled. | All three SEED-IV sessions separately, 15 targets/session, seeds 42/43/44. Deliver per-run configs/hashes, logs, checkpoints, metrics, and failures. |
+| B | Own C1 phase B (`metric_lr_multiplier=3`, `gamma=0.25`), but start only if phase A completes and passes the predeclared gate. | Exactly the same folds as A. Deliver paired deltas, class-pair confusion changes, the two mechanism figures, and the stop/continue recommendation. |
+| C | Own the external-dataset work package and independent QA: SEED Session 2 and SEED-V Session 1, checking label mapping, local paths, smoke manifests, and separate summaries. | Current smoke is done; any later full LOSO is separately authorized. Review C1 run provenance and reproduce aggregate tables without pooling sessions or datasets. |
+
+For C1, A and B must not be split by session: both methods use the same complete three-session LOSO scope. The previous C2 method-based assignment below is a later, separate work package.
+
+## C2 planned follow-on scope
+
+The later C2 study asks whether held-out source evidence can predict which source/class-pair correction will improve the frozen E0 reference, and whether strictly past margin summaries add value beyond the current window and ordinary probability smoothing. The scope is **SEED-IV Sessions 1, 2, and 3, each evaluated separately**—never pooled for training—with all 15 subjects as outer targets and seeds 42, 43, and 44. This is 135 outer cells per method (not 135 total across all methods). Each C2 outer cell needs four inner teacher fits; those are cached and shared across that cell's C2 variants.
+
+The frozen parent is the C1 E0 configuration `592351bfb649e601`. The new three-session C2 config has a distinct hash and records the exact parent checkpoint SHA-256 per run. The existing parent audit covers 90 E0 artifacts in Sessions 1 and 2; **the 45 Session 3 E0 parent checkpoints are currently missing from the audited path**. Consequently, the three-session parent audit is incomplete, and C2 full execution is blocked until those exact-config E0 runs are completed and audited. The previously passed single-fold pilot belongs to the old Sessions 1–2 configuration and is retained only as historical engineering evidence; it does not validate this expanded config or unlock the new matrix. No full three-session matrix has run.
+
+The new engineering pilot is fixed to Session 3 / target 1 / seed 42, so it can exercise the newly added session path. It cannot run until that exact E0 parent checkpoint is available and audited. The old Session 1 pilot remains inspectable but is not accepted as a substitute. After the Session 3 pilot passes and the owner signs its acceptance record, the full 135-cell-per-method matrix can start—only after all 135 E0 parents are present.
+
+## Model at a glance
+
+The SEED-IV reference model is `GeoSemSTDA`: a Strong-DE / channel-selection / graph backbone produces a shared representation; source-specific adapters map it toward frozen CLIP text prototypes for the four emotion classes; the original source branches are fused at the logits level using the E0 distance-based rule. C2 freezes that complete reference and adds a shared router that scores candidate source/class-pair actions from reference and expert logits, source distances, and class-pair prototype features.
+
+For each source and each of the six unordered class pairs, the router predicts the full multiclass cross-entropy improvement
+
+`utility = CE(reference_logits, label) - CE(action_logits, label)`.
+
+At inference, the action with the greatest predicted positive utility is applied, with a no-op when no candidate is predicted to help. The action is a bounded pairwise logit residual; there is no label-based candidate filtering and no product of confidence scores. The first comparison uses current-window features. The history variant additionally reads only prior reference/expert margins within the same trial; state is updated only after the current decision and resets at every trial. A probability EMA is a separate smoothing control.
+
+The internal evidence protocol partitions the 14 outer sources into a deterministic 2-person source-dev set and a 12-person OOF/router pool. Three teachers each train on eight pool subjects and produce evidence for four unseen pool subjects; one 12-source teacher produces source-dev evidence for the two dev subjects. The outer target and dev subjects are excluded from OOF teacher fitting. Router inputs accept the resulting 8-, 12-, or 14-source evidence. All methods use the same split and cached teachers for a given outer fold/seed.
+
+Normalization follows the parent per-subject rule: each evaluated subject contributes only its own unlabeled session moments. Because the existing preprocessing can use an entire session and DE-LDS, this experiment does not claim end-to-end online causality. The router history itself is strictly causal within each trial.
+
+## C2 quick start
+
+Configure local dataset and CLIP paths in `data_utils/constants/path_mapper.py` and `data_utils/text_to_vector.py`. Use the locally prepared Python 3.11/PyTorch environment with a matching CUDA build; this checkout does not include a portable conda environment export.
+
+From the repository root in PowerShell:
 
 ```powershell
-.\experiments\seed\run_geosem_stda_seed_sgda_full.ps1
+$PY = "python"
+& $PY experiments\seediv_c2_experiment.py audit
+& $PY experiments\seediv_c2_experiment.py plan
+& $PY tests\test_seediv_c2_pipeline.py
 ```
 
-Default SEED setting:
-
-```text
-sessions = 1, 2, 3
-classes = 3
-sample_length = 3
-stride = 1
-epochs = 200
-batch_size = 128
-mmd_type = resgca
-final selected sources = Top-6 reliability sources
-```
-
-### SEED-IV
+These commands recheck parent artifacts (and report any missing Session 3 cells), print the plan, and run synthetic tests. The old Session 1 pilot used target 1, seed 42, and B0, B1, C2-current, and C2-history; it took about 33 minutes on an NVIDIA GeForce RTX 5060 Laptop GPU but is bound to the old two-session config. The new pilot uses Session 3 / target 1 / seed 42 and must be run only after its E0 parent exists:
 
 ```powershell
-.\experiments\seediv\run_geosem_stda_seediv_sgda_full.ps1
+& $PY experiments\seediv_c2_experiment.py pilot --execute --device cuda:0
 ```
 
-Default SEED-IV setting:
+Inspect `artifacts/seediv_c2_s1s2s3_parent_audit.json`, the new report at `artifacts/seediv_c2_s1s2s3_pilot_report.json`, and outputs under `results/seediv_c2_e0_s1s2s3/<config-hash>/<implementation-id>/`. The old independent pilot audit script is tied to the previous two-session pilot and is not a verifier for the new run. Do not launch full execution until all 135 parent E0 cells pass audit and the project owner reviews the new pilot and records every checklist item in `artifacts/seediv_c2_s1s2s3_pilot_acceptance.json` using [`docs/templates/seediv_c2_pilot_acceptance_TEMPLATE.json`](docs/templates/seediv_c2_pilot_acceptance_TEMPLATE.json). The record must match the exact pilot-report hash and current code/config fingerprints. The runner checks these gates before full execution.
 
-```text
-sessions = 1, 2, 3
-classes = 4
-sample_length = 3
-stride = 1
-epochs = 200
-batch_size = 64
-mmd_type = resgca
-final selected sources = Top-6 reliability sources
-```
+The other planned contrasts are C2-current-EMA, C2-current-matched (same router capacity with the history slot replaced by a fixed current-feature mapping), and C2-current-Huber. The initial pilot is deliberately limited to the core path; complete the contrast implementation checks before expanding the matrix.
 
-### SEED-V
+## Core configuration and evidence
 
-```powershell
-.\experiments\seedv\run_geosem_stda_seedv_sgda_full.ps1
-```
+- Frozen parent C1 config: `configs/seediv_c1_full45.json` (verify its effective hash before use).
+- C2 config: `configs/seediv_c2_e0_s1s2s3.json`.
+- Runner: `experiments/seediv_c2_experiment.py`.
+- C2 history and output EMA: `models/causal_evidence_history.py`.
+- Shared pairwise router: `models/pairwise_utility_router.py`.
+- Deterministic split, hash and run identity helpers: `utils/seediv_c2_protocol.py`.
+- Detailed protocol and group delivery contract: `docs/SEEDIV_C2_E0_EXPERIMENT_PLAN.md`.
+- Current implementation audit/status: `docs/SEEDIV_C2_IMPLEMENTATION_AUDIT.md`.
 
-Default SEED-V setting:
+Each run is expected to retain config/parent/data hashes, actual inner splits, sample and time indices, teacher training records, evidence caches, epoch logs, both source-dev and target-report artifacts, sample-level predictions/actions/utilities, standard classification metrics, action/no-op and negative-utility rates, corrected/harmed prediction counts, and a reproducible run status. Final summaries are reported separately for each session and combined, with paired comparisons on matching session-target-seed cells; subject is the inferential cluster.
 
-```text
-sessions = 1, 2, 3
-classes = 5
-sample_length = 3
-stride = 1
-epochs = 200
-batch_size = 64
-mmd_type = resgca
-final selected sources = Top-6 reliability sources
-```
+## C2 follow-on work split
 
-The unified script reshapes SEED-V flat features from `[L, 310]` to `[L, 62, 5]` before model input.
+Members own methods, not sessions. Every member covers Sessions 1, 2, and 3 separately for their assigned method family, using the same frozen E0 parent, all targets, all seeds, split protocol, and output schema. Each method therefore has 135 outer cells.
 
-### DREAMER
-
-```powershell
-.\experiments\dreamer\run_geosem_stda_dreamer_sgda_full.ps1
-```
-
-Default DREAMER setting:
-
-```text
-session = 1
-task = valence binary classification
-sample_length = 3
-stride = 1
-epochs = 200
-batch_size = 64
-mmd_type = resgca
-dreamer_ea = true
-final selected sources = Top-6 reliability sources
-```
-
-For arousal:
-
-```powershell
-python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --dreamer_labeltype aro
-```
-
-## DREAMER Pilot-5 Diagnostic Protocol
-
-This protocol is for checking whether the current GeoSem-STDA alignment modules help DREAMER before launching a full ablation suite. It does not change the senior SGDA evaluation rule: the reported target metric is still the best target epoch accuracy.
-
-### Build the fixed Pilot-5 split
-
-```powershell
-.\experiments\dreamer\build_dreamer_pilot5.ps1
-```
-
-The split is selected without labels, predictions, or accuracy. Each DREAMER subject is represented by a subject-level log-Euclidean SPD center. Difficulty is the average Frobenius distance from one subject center to all other subject centers. The fixed Pilot-5 targets cover geometry difficulty percentiles P10/P30/P50/P70/P90:
-
-| Level | Target subject | Difficulty |
-|---|---:|---:|
-| Easy | 12 | 1.772655 |
-| Medium-Easy | 11 | 1.926365 |
-| Medium | 2 | 2.017798 |
-| Medium-Hard | 22 | 2.057518 |
-| Hard | 4 | 2.392209 |
-
-The saved protocol file is:
-
-```text
-results/pilot_protocol/dreamer_pilot5.json
-```
-
-### Run the smoke test first
-
-```powershell
-.\experiments\dreamer\run_dreamer_pilot5_smoke.ps1
-```
-
-The smoke test runs one Pilot target for two epochs across all four variants. Confirm that losses are finite, P0 alignment loss is zero, Top-6 variants select six sources, the all-source variant selects all 22 source subjects, and all output files are created.
-
-### Run the formal Pilot-5 diagnostics
-
-```powershell
-.\experiments\dreamer\run_dreamer_pilot5_diagnostics.ps1
-```
-
-This runs the same five fixed target subjects for 200 epochs with the same DREAMER hyperparameters as the main protocol.
-
-### Diagnostic variants
-
-| Variant | CLI value | Output folder | Purpose |
-|---|---|---|---|
-| P0 | `proto_only` | `results/dreamer_pilot5/P0_proto_only_top6/` | Prototype-only baseline, Top-6 sources, no domain alignment. |
-| P1 | `conditional` | `results/dreamer_pilot5/P1_conditional_top6/` | Simple class-conditional semantic alignment, Top-6 sources. |
-| P2 | `resgca_topk` | `results/dreamer_pilot5/P2_resgca_top6/` | Current full ReSGCA model, Top-6 reliability sources. |
-| P3 | `resgca_all` | `results/dreamer_pilot5/P3_resgca_all_sources/` | Current full ReSGCA model with all 22 source subjects. |
-
-Each variant folder saves:
-
-```text
-per_subject_results.csv
-summary.json
-training_log.txt
-source_selection.json
-```
-
-The automatic comparison files are:
-
-```text
-results/dreamer_pilot5/pilot5_diagnostic_comparison.csv
-results/dreamer_pilot5/pilot5_diagnostic_deltas.json
-```
-
-Decision rule:
-
-- If P2 is better than P0 and P1, the full reliability-guided semantic-geometric alignment is useful.
-- If P3 is better than P2, Top-6 source pruning may be too aggressive on DREAMER.
-- If P1 is better than P2, the current geometry or reliability gating may be hurting alignment.
-- If P0 is best, DREAMER may benefit more from representation learning and evaluation fusion than from stronger domain alignment.
-
-Single-variant commands are also available:
-
-```powershell
-python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant proto_only
-python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant conditional
-python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant resgca_topk
-python experiments\crossSubject_geosem_stda_sgda.py --dataset_name dreamer --pilot_mode --pilot_config results\pilot_protocol\dreamer_pilot5.json --experiment_variant resgca_all
-```
-
-## Smoke Test
-
-Before running all subjects, run one subject for a few epochs:
-
-```powershell
-python experiments\crossSubject_geosem_stda_sgda.py `
-  --dataset_name seediv `
-  --session_ids 1 `
-  --target_subject_ids 1 `
-  --epochs 3 `
-  --reliability_warmup_epochs 1 `
-  --sparse_k_max 3
-```
-
-If this succeeds, run the corresponding full `.ps1` script.
-
-## Useful Switches
-
-Use the default `.ps1` scripts for the main experiment. Change these only for ablation or comparison.
-
-| Purpose | Parameter |
+| Member | Work package |
 |---|---|
-| Run fixed target subjects | `--target_subject_ids 1 4 7 10 13` |
-| Run one session | `--session_ids 1` |
-| Random target subset | `--random_target_count 5 --target_seed 42` |
-| Disable source selection | `--source_selection none` |
-| Use class-aware MMD | `--mmd_type class_aware` |
-| Use ReSGCA | `--mmd_type resgca` |
-| Use HUT/RCUOT | `--mmd_type hut --uot_epsilon 0.10 --uot_tau_t 0.7 --uot_n_iter 12 --no_hut_agreement_mass` |
-| Evaluate by feature centroids | `--eval_classifier senior_feature` |
-| Use reliability fusion in evaluation | `--reliability_fusion` |
+| A | E0 evidence export; B0 reference and B1 probability-EMA controls; frozen-reference/oracle checks; sample-level final-fusion diagnostics. |
+| B | OOF/source-dev teachers and provenance; evidence cache; C2-current MSE and current-structure Huber contrast. |
+| C | Strict history variant; C2-current-EMA; capacity-matched current-feature control; history, reset, and chunked-inference checks. |
 
-## Team Requirements
+The detailed experiment plan names each deliverable and validation. Before the owner accepts the new Session 3 pilot and all 135 E0 parent cells pass audit, member work is limited to reviewing the shared code/protocol and fixing documented acceptance failures; do not start the full matrix. No member may alter the shared config, data, or code silently; changes require a versioned config and a recorded commit. Do not split sessions across members because method comparisons must cover the same complete scope.
 
-Group members should:
+## Original SGDA and other experiments
 
-1. Use the latest `main` branch.
-2. Activate the correct conda environment.
-3. Check `path_mapper.py` before running.
-4. Run one smoke test first.
-5. For formal results, run the dataset `.ps1` script without changing hyperparameters.
-6. Report `best_acc`, `macro_f1`, `micro_f1`, `best_epoch`, and the path to `run_config.json`.
-7. Do not compare results from different `sample_length`, `stride`, source count, or epoch settings as the same protocol.
+Original SGDA code remains available in `experiments/seediv/crossSubjects_seediv.py` and the dataset-specific launchers. GeoSem-STDA code is in `models/geosem_stda.py` and `experiments/crossSubject_geosem_stda_sgda.py`. The broader DEAP, SEED, SEED-IV, SEED-V and DREAMER launchers are separate from this C2 study; their options and output conventions should be checked against each launcher before use.
 
-## Current DEAP Partial Progress
+For the separate external-dataset checks, see [`docs/SEED_SEEDV_SINGLE_SESSION_EXPLORATION.md`](docs/SEED_SEEDV_SINGLE_SESSION_EXPLORATION.md) and [`experiments/run_seed_seedv_session1_exploratory.ps1`](experiments/run_seed_seedv_session1_exploratory.ps1). The scope is SEED Session 2 and SEED-V Session 1; it is not part of C2 and its scores must not be pooled with SEED-IV or with each other.
 
-The latest DEAP 15-target protocol has completed these targets:
+## Data and local model paths
 
-| Target | best_acc | best_epoch | final_acc |
-|---:|---:|---:|---:|
-| 2 | 44.72% | 51 | 35.28% |
-| 3 | 70.28% | 166 | 64.72% |
-| 6 | 60.42% | 102 | 52.92% |
+Datasets are not included. Set the local dataset roots in `data_utils/constants/path_mapper.py` and the CLIP model path in `data_utils/text_to_vector.py`. Do not commit private EEG data, pretrained weights, or machine-specific secrets. The C2 run manifest records data fingerprints rather than copying the data into the repository.
 
-Current completed-target mean best accuracy is about 58.47%.
+## Research and interpretation boundary
+
+The old two-session engineering pilot and provenance audit passed, but they do not validate the expanded three-session config, and one target is not a scientific efficacy study. Do not claim a C2 gain from either pilot. The comparison is intended to distinguish: (1) whether C2-current improves on frozen E0 and which predicted actions account for changes; and (2) whether history adds value over probability smoothing and a capacity-matched current-only control. Report per-subject paired results and uncertainty clustered by subject; overlapping windows and the 135 run cells are not independent participants.

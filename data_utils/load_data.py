@@ -20,7 +20,12 @@ def get_data(setting=None, **kwargs):#setting默认值是None
         print(f"Error: Setting not set")
 
     # 以统一格式获取数据，加载数据集并集成到（session, subject, trail）格式中
-    data, baseline, label, sample_rate, channels = get_uniform_data(setting.dataset, setting.dataset_path, **kwargs)
+    data, baseline, label, sample_rate, channels = get_uniform_data(
+        setting.dataset,
+        setting.dataset_path,
+        session_ids=getattr(setting, "sessions", None),
+        **kwargs,
+    )
 
     use_riemann = kwargs.get('use_riemann', False)
     if use_riemann:
@@ -53,7 +58,7 @@ extract_dataset = {
     "seediv_psd_movingAve", "seediv_psd_lds", "faced_de", "faced_psd", "faced_de_lds", "faced_psd_lds"
 }
 
-def get_uniform_data(dataset, dataset_path, **kwargs):
+def get_uniform_data(dataset, dataset_path, session_ids=None, **kwargs):
     """
     Mainly aimed at the structure of different datasets,
     it is divided into the form of (session, subject, trail, channel, raw_data).
@@ -70,7 +75,9 @@ def get_uniform_data(dataset, dataset_path, **kwargs):
         "hci": read_hci
     }
     if dataset.startswith("seediv") and dataset != "seediv_raw":
-        data, baseline, label, sample_rate, channels = read_seedIV_feature(dataset_path, feature_type=dataset[7:])
+        data, baseline, label, sample_rate, channels = read_seedIV_feature(
+            dataset_path, feature_type=dataset[7:], sessions=session_ids
+        )
         # 提取从位置8开始到末尾的字段。 如dataset=seediv_de_lds，则dataset[7:]为de_lds
     elif dataset.startswith("seed") and not dataset.startswith("seediv") and dataset != "seed_raw":
         # call the read_seed_feature function when using the feature provided by seed official
@@ -296,7 +303,7 @@ def parallel_read_seedIV_raw(dir_path, file):
     return trail_datas
 
 
-def read_seedIV_feature(dir_path, feature_type="de_lds"):
+def read_seedIV_feature(dir_path, feature_type="de_lds", sessions=None):
     # 读取seed IV数据集
     # input file : three folder each contains one session of 15 subjects' eeg data
     # output shape : (session(3), subject, trail, channel, feature), (session(3), subject, trail, label)
@@ -341,16 +348,27 @@ def read_seedIV_feature(dir_path, feature_type="de_lds"):
     }
     fi = feature_index[feature_type]
 
-    eeg_data = [[] for _ in range(3)]
+    session_ids = [1, 2, 3] if sessions is None else [int(value) for value in sessions]
+    if not session_ids or len(set(session_ids)) != len(session_ids) or any(value not in (1, 2, 3) for value in session_ids):
+        raise ValueError(f"SEED-IV sessions must be unique IDs from 1, 2, 3; got {session_ids}")
+    eeg_data = []
     # Define a function to read a single Mat file
-    for ses_id, session_files in enumerate(eeg_files):
-        with mp.Pool(processes=5) as pool:
-            result_session = pool.map(
-                partial(parallel_read_seedIV_feature, fi, dir_path, label), eeg_files[ses_id]
-            )
-        for i in range(15):
-            eeg_data[ses_id].append(result_session[i])
-    return eeg_data, None, label, None, 62
+    # Windows ``spawn`` imports PyTorch again in every child process.  On
+    # memory-constrained machines this can exhaust the page file before a
+    # single experiment starts.  Keep the historical default (5 workers), but
+    # allow controlled experiments to request deterministic serial loading.
+    seediv_load_workers = max(int(os.environ.get("SGDA_SEEDIV_LOAD_WORKERS", "5")), 1)
+    for session_id in session_ids:
+        ses_id = session_id - 1
+        reader = partial(parallel_read_seedIV_feature, fi, dir_path, label)
+        if seediv_load_workers == 1:
+            result_session = [reader(file) for file in eeg_files[ses_id]]
+        else:
+            with mp.Pool(processes=seediv_load_workers) as pool:
+                result_session = pool.map(reader, eeg_files[ses_id])
+        eeg_data.append([result_session[i] for i in range(15)])
+    selected_labels = label[np.asarray(session_ids, dtype=np.int64) - 1]
+    return eeg_data, None, selected_labels, None, 62
 def parallel_read_seedIV_feature(fi, dir_path, label, file):
     subject_data = loadmat(f"{dir_path}/{file}")
     keys = list(subject_data.keys())[3:]

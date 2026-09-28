@@ -1,0 +1,21 @@
+{
+  "status": "PENDING",
+  "accepted_by": "",
+  "accepted_at": "",
+  "config_hash": "",
+  "pilot_report_sha256": "",
+  "implementation_hashes": {},
+  "checklist": {
+    "b0_matches_parent": false,
+    "oof_sample_exclusion_verified": false,
+    "history_future_isolation_verified": false,
+    "trial_reset_and_chunking_verified": false,
+    "noop_invariant_verified": false,
+    "cached_ce_utility_verified": false,
+    "final_fusion_sample_diagnostics_verified": false,
+    "teachers_frozen_during_router_training": false,
+    "method_controls_independently_verified": false,
+    "resume_consistency_verified_or_not_supported": false
+  },
+  "notes": "Copy this template to artifacts/seediv_c2_s1s2s3_pilot_acceptance.json only after the project owner audits all 135 C1 E0 parent cells, reviews the new Session 3 / target 1 / seed 42 pilot report, and verifies every item. Keep status PENDING until all checks pass. Full execution is blocked otherwise."
+}

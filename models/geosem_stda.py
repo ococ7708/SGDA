@@ -40,6 +40,46 @@ def shrinkage_covariance(x, shrinkage=0.1, eps=1e-5):
     return 0.5 * (cov + cov.transpose(-1, -2))
 
 
+def oas_covariance(x, eps=1e-5):
+    """Batched Oracle Approximating Shrinkage covariance for DE samples."""
+    if x.dim() != 4:
+        raise ValueError(f"Expected x shape [B,L,C,F], got {tuple(x.shape)}")
+
+    bsz, steps, channels, bands = x.shape
+    n_obs = steps * bands
+    y = x.permute(0, 2, 1, 3).reshape(bsz, channels, n_obs)
+    y = y - y.mean(dim=-1, keepdim=True)
+    empirical = y @ y.transpose(-1, -2) / max(n_obs, 1)
+    mu = empirical.diagonal(dim1=-2, dim2=-1).sum(dim=-1) / channels
+    alpha = empirical.square().mean(dim=(-2, -1))
+    mu_sq = mu.square()
+    numerator = alpha + mu_sq
+    denominator = (n_obs + 1.0) * (alpha - mu_sq / channels)
+    shrinkage = torch.where(
+        denominator > 0,
+        (numerator / denominator.clamp_min(torch.finfo(x.dtype).eps)).clamp(max=1.0),
+        torch.ones_like(denominator),
+    )
+    eye = torch.eye(channels, device=x.device, dtype=x.dtype).expand(bsz, channels, channels)
+    cov = (1.0 - shrinkage[:, None, None]) * empirical
+    cov = cov + shrinkage[:, None, None] * mu[:, None, None] * eye + eps * eye
+    return 0.5 * (cov + cov.transpose(-1, -2))
+
+
+def oas_log_euclidean_reference(source_batches, eps=1e-5):
+    """Return the source-only mean log-covariance using batched OAS."""
+    if not source_batches:
+        raise ValueError("source_batches must not be empty when computing reference geometry")
+    logs = [_matrix_log_spd(oas_covariance(x, eps=eps), eps=eps) for x in source_batches]
+    return torch.cat(logs, dim=0).mean(dim=0)
+
+
+def oas_tangent_deviation(x, log_reference, eps=1e-5):
+    """Map OAS covariances into one shared source Log-Euclidean frame."""
+    cov = oas_covariance(x, eps=eps)
+    return _matrix_log_spd(cov, eps=eps) - log_reference.to(device=x.device, dtype=x.dtype)
+
+
 def log_euclidean_reference(source_batches, shrinkage=0.1, eps=1e-5):
     """Compute G from source batches only, then return log(G)."""
     if not source_batches:
@@ -569,6 +609,7 @@ class GeometricEvidenceResidual(nn.Module):
         self.last_evidence_norm = None
         self.last_residual_norm = None
         self.last_base_norm = None
+        self.last_residual_to_base_ratios = None
 
     @property
     def beta(self):
@@ -582,9 +623,15 @@ class GeometricEvidenceResidual(nn.Module):
             )
         g_geo = self.project(symmetric_frobenius_vector(tangent_deviation_matrix))
         residual = self.beta * g_geo
-        self.last_base_norm = float(h_de.detach().norm(dim=-1).mean().cpu())
-        self.last_evidence_norm = float(g_geo.detach().norm(dim=-1).mean().cpu())
-        self.last_residual_norm = float(residual.detach().norm(dim=-1).mean().cpu())
+        base_norms = h_de.detach().norm(dim=-1)
+        evidence_norms = g_geo.detach().norm(dim=-1)
+        residual_norms = residual.detach().norm(dim=-1)
+        self.last_base_norm = float(base_norms.mean().cpu())
+        self.last_evidence_norm = float(evidence_norms.mean().cpu())
+        self.last_residual_norm = float(residual_norms.mean().cpu())
+        self.last_residual_to_base_ratios = (
+            residual_norms / base_norms.clamp_min(1e-12)
+        ).cpu()
         return self.fusion_norm(h_de + residual), g_geo
 
 

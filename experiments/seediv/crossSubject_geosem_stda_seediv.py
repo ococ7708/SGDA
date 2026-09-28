@@ -126,7 +126,11 @@ def _parse_session_indices(session_indices, n_sessions):
 
 
 def _compute_class_weights(labels, num_classes, device):
-    y = np.asarray(labels).reshape(-1)
+    # Some prepared loaders (notably SEED-V pickle files) expose integral
+    # class ids as float64. np.bincount requires an integer dtype.
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if np.any(y < 0) or np.any(y >= num_classes):
+        raise ValueError(f"labels must be integer class ids in [0, {num_classes})")
     counts = np.bincount(y, minlength=num_classes).astype(np.float32)
     counts = np.maximum(counts, 1.0)
     weights = counts.sum() / (num_classes * counts)

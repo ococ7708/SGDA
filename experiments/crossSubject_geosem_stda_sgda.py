@@ -61,6 +61,8 @@ from models.geosem_stda import (
     compute_source_domain_centroids,
     linear_classification_loss,
     log_euclidean_reference,
+    oas_log_euclidean_reference,
+    oas_tangent_deviation,
     prototype_contrastive_loss,
 )
 from utils.args import get_args_parser
@@ -223,6 +225,13 @@ RAPID_VARIANTS = {
         "name": "E3_strong_de_channel_graph",
         "representation_mode": "cast_level1",
         "classifier_type": "clip",
+        "cast_level1": True,
+        "cast_variant": "e3_strong_de_channel_graph",
+    },
+    "s0_e3_linear": {
+        "name": "S0_E3_linear",
+        "representation_mode": "cast_level1",
+        "classifier_type": "linear",
         "cast_level1": True,
         "cast_variant": "e3_strong_de_channel_graph",
     },
@@ -551,16 +560,60 @@ def _build_fold_representation_inputs(
         geometry_data = list(session_data)
         for sid, indices in source_subset_indices.items():
             geometry_data[sid] = np.asarray(session_data[sid])[indices]
-    geometry = build_geometry_for_fold(
-        geometry_data,
-        source_ids,
-        target_sub,
-        args.device,
-        shrinkage=args.shrinkage,
-        eps=args.spd_eps,
-        batch_size=args.geometry_batch_size,
-    )
+    if args.representation_mode == "sgda_geo_residual":
+        geometry = _build_oas_geometry_for_fold(
+            geometry_data,
+            source_ids,
+            target_sub,
+            args.device,
+            eps=args.spd_eps,
+            batch_size=args.geometry_batch_size,
+        )
+    else:
+        geometry = build_geometry_for_fold(
+            geometry_data,
+            source_ids,
+            target_sub,
+            args.device,
+            shrinkage=args.shrinkage,
+            eps=args.spd_eps,
+            batch_size=args.geometry_batch_size,
+        )
     return geometry, False
+
+
+@torch.no_grad()
+def _build_oas_geometry_for_fold(session_data, source_ids, target_id, device, eps, batch_size):
+    """Build one source-only OAS Log-Euclidean coordinate frame for a LOSO fold."""
+    log_sum = None
+    source_count = 0
+    for sid in source_ids:
+        x = torch.tensor(np.asarray(session_data[sid]), dtype=torch.float32, device=device)
+        for start in range(0, x.size(0), batch_size):
+            batch = x[start:start + batch_size]
+            batch_log_reference = oas_log_euclidean_reference([batch], eps=eps)
+            n_batch = batch.size(0)
+            log_sum = (
+                batch_log_reference * n_batch
+                if log_sum is None
+                else log_sum + batch_log_reference * n_batch
+            )
+            source_count += n_batch
+    if source_count == 0:
+        raise ValueError("Source training data are empty; cannot fit the shared OAS reference")
+    log_reference = log_sum / source_count
+
+    r_by_subject = {}
+    for sid in source_ids + [target_id]:
+        x = torch.tensor(np.asarray(session_data[sid]), dtype=torch.float32, device=device)
+        parts = [
+            oas_tangent_deviation(x[start:start + batch_size], log_reference, eps=eps).cpu()
+            for start in range(0, x.size(0), batch_size)
+        ]
+        if not parts:
+            raise ValueError(f"S{sid + 1} has no samples for shared-reference geometry")
+        r_by_subject[sid] = torch.cat(parts, dim=0)
+    return r_by_subject
 
 
 def _count_parameters(model):
@@ -666,6 +719,16 @@ def _classification_diagnostics(y_true, y_pred):
     tn, fp, fn, tp = [int(value) for value in cm.ravel()]
     recall0 = float(tn / max(tn + fp, 1))
     recall1 = float(tp / max(tp + fn, 1))
+    predicted_ratio0 = float((y_pred == 0).mean())
+    predicted_ratio1 = float((y_pred == 1).mean())
+    collapse_reasons = []
+    if recall0 < 0.05:
+        collapse_reasons.append("recall_class0_below_0.05")
+    if recall1 < 0.05:
+        collapse_reasons.append("recall_class1_below_0.05")
+    if max(predicted_ratio0, predicted_ratio1) > 0.95:
+        collapse_reasons.append("predicted_class_ratio_above_0.95")
+    collapse_warning = bool(collapse_reasons)
     return {
         "confusion_matrix": cm.tolist(),
         "TN": tn,
@@ -675,10 +738,13 @@ def _classification_diagnostics(y_true, y_pred):
         "recall_class0": recall0,
         "recall_class1": recall1,
         "balanced_accuracy": 0.5 * (recall0 + recall1),
-        "predicted_class0_ratio": float((y_pred == 0).mean()),
-        "predicted_class1_ratio": float((y_pred == 1).mean()),
+        "predicted_class0_ratio": predicted_ratio0,
+        "predicted_class1_ratio": predicted_ratio1,
         "true_class0_ratio": float((y_true == 0).mean()),
         "true_class1_ratio": float((y_true == 1).mean()),
+        "collapse_status": "CLASS_COLLAPSE_WARNING" if collapse_warning else "OK",
+        "class_collapse_warning": collapse_warning,
+        "collapse_reasons": collapse_reasons,
     }
 
 
@@ -688,6 +754,7 @@ def _geometric_residual_diagnostics(model, data_loader, device):
         return {}
     totals = {"base_norm": 0.0, "geometry_evidence_norm": 0.0, "geometry_residual_norm": 0.0}
     count = 0
+    ratio_parts = []
     model.eval()
     for x, r, _ in data_loader:
         batch_size = x.size(0)
@@ -696,11 +763,17 @@ def _geometric_residual_diagnostics(model, data_loader, device):
         totals["base_norm"] += module.last_base_norm * batch_size
         totals["geometry_evidence_norm"] += module.last_evidence_norm * batch_size
         totals["geometry_residual_norm"] += module.last_residual_norm * batch_size
+        ratio_parts.append(module.last_residual_to_base_ratios)
         count += batch_size
     result = {key: value / max(count, 1) for key, value in totals.items()}
-    result["residual_to_base_norm_ratio"] = (
-        result["geometry_residual_norm"] / max(result["base_norm"], 1e-12)
-    )
+    ratios = torch.cat(ratio_parts) if ratio_parts else torch.empty(0)
+    ratio_mean = float(ratios.mean()) if ratios.numel() else np.nan
+    ratio_std = float(ratios.std(unbiased=True)) if ratios.numel() > 1 else 0.0
+    result["de_embedding_norm_mean"] = result["base_norm"]
+    result["geometry_embedding_norm_mean"] = result["geometry_evidence_norm"]
+    result["residual_to_de_norm_ratio_mean"] = ratio_mean
+    result["residual_to_de_norm_ratio_std"] = ratio_std
+    result["residual_to_base_norm_ratio"] = ratio_mean
     result["beta"] = model.current_beta()
     return result
 
@@ -1208,12 +1281,22 @@ def load_dataset(args):
     else:
         raise ValueError(f"Unsupported dataset_name: {dataset_name}")
 
-    text_dim, class_vectors = label_to_vector(
-        dataset=text_dataset,
-        LM=args.LM,
-        LabelTextMapper=None,
-        device=args.device,
-    )
+    if getattr(args, "classifier_type", "clip") == "linear":
+        # A linear-only control must not load or use a language model.  Keep the
+        # established 512-d EEG projection so the backbone comparison is exact.
+        text_dim = 512
+        class_vectors = {
+            class_id: np.zeros(text_dim, dtype=np.float32)
+            for class_id in range(num_classes)
+        }
+        print("Linear control: skipped text encoder and CLIP prototypes.")
+    else:
+        text_dim, class_vectors = label_to_vector(
+            dataset=text_dataset,
+            LM=args.LM,
+            LabelTextMapper=None,
+            device=args.device,
+        )
     return data, label, class_vectors, channels, num_freq_bands, num_classes, text_dim
 
 
@@ -1430,6 +1513,7 @@ def run(args):
                 "[SGRAD STEP-1] One shared Log-Euclidean reference is fitted from source training data only",
                 training_log_path,
             )
+            _log("[SGRAD STEP-1] Covariance estimator: OAS", training_log_path)
             _log("[SGRAD STEP-1] Geometry enters only through a small scalar-gated residual", training_log_path)
 
     run_config = {
@@ -1466,6 +1550,9 @@ def run(args):
         "geometry_reference_policy": (
             "single_shared_source_training_log_euclidean_reference"
             if args.representation_mode == "sgda_geo_residual" else None
+        ),
+        "geometry_covariance_estimator": (
+            "OAS" if args.representation_mode == "sgda_geo_residual" else None
         ),
         "geometry_uses_target_labels": False,
         "source_candidate_count_per_target": n_subjects - 1,
@@ -1526,10 +1613,13 @@ def run(args):
         "epochs", "classifier_type", "representation_mode", "cast_variant", "screening_mode", "beta_initial",
         "beta_at_best", "beta_final", "fixed_beta", "total_params", "trainable_params",
         "geometry_evidence_norm", "geometry_residual_norm", "residual_to_base_norm_ratio",
+        "de_embedding_norm_mean", "geometry_embedding_norm_mean",
+        "residual_to_de_norm_ratio_mean", "residual_to_de_norm_ratio_std",
         "balanced_accuracy", "recall_class0", "recall_class1",
         "TN", "FP", "FN", "TP",
         "predicted_class0_ratio", "predicted_class1_ratio",
         "true_class0_ratio", "true_class1_ratio",
+        "collapse_status", "class_collapse_warning", "collapse_reasons",
         "final_acc", "final_macro_f1",
     ]
     subject_records = []
@@ -2071,6 +2161,10 @@ def run(args):
                 "geometry_evidence_norm": diagnostics.get("geometry_evidence_norm", np.nan),
                 "geometry_residual_norm": diagnostics.get("geometry_residual_norm", np.nan),
                 "residual_to_base_norm_ratio": diagnostics.get("residual_to_base_norm_ratio", np.nan),
+                "de_embedding_norm_mean": diagnostics.get("de_embedding_norm_mean", np.nan),
+                "geometry_embedding_norm_mean": diagnostics.get("geometry_embedding_norm_mean", np.nan),
+                "residual_to_de_norm_ratio_mean": diagnostics.get("residual_to_de_norm_ratio_mean", np.nan),
+                "residual_to_de_norm_ratio_std": diagnostics.get("residual_to_de_norm_ratio_std", np.nan),
                 "balanced_accuracy": diagnostics["balanced_accuracy"],
                 "recall_class0": diagnostics["recall_class0"],
                 "recall_class1": diagnostics["recall_class1"],
@@ -2080,6 +2174,9 @@ def run(args):
                 "predicted_class1_ratio": diagnostics["predicted_class1_ratio"],
                 "true_class0_ratio": diagnostics["true_class0_ratio"],
                 "true_class1_ratio": diagnostics["true_class1_ratio"],
+                "collapse_status": diagnostics.get("collapse_status", ""),
+                "class_collapse_warning": diagnostics.get("class_collapse_warning", False),
+                "collapse_reasons": json.dumps(diagnostics.get("collapse_reasons", [])),
                 "final_acc": final_acc,
                 "final_macro_f1": final_macro,
             }
@@ -2121,6 +2218,9 @@ def run(args):
         "screening_mode": args.cast_balanced_screening,
         "representation_mode": args.representation_mode,
         "classifier_type": args.classifier_type,
+        "geometry_covariance_estimator": (
+            "OAS" if args.representation_mode == "sgda_geo_residual" else None
+        ),
         "dataset_name": args.dataset_name,
         "task": args.dreamer_labeltype if args.dataset_name == "dreamer" else "",
         "pilot_mode": args.pilot_mode,
@@ -2178,6 +2278,12 @@ def run(args):
         "source_selection_json": source_selection_path,
         "target_labels_used_for_training": False,
         "target_labels_used_for_epoch_selection": True,
+        "class_collapse_warning": any(
+            bool(row["class_collapse_warning"]) for row in subject_records
+        ),
+        "collapse_status_by_subject": {
+            str(row["target_subject"]): row["collapse_status"] for row in subject_records
+        },
     }
     _write_json(source_selection_path, source_selection_records)
     if args.cast_balanced_screening:

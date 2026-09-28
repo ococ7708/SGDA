@@ -211,6 +211,8 @@ class AffectiveMetricHead(nn.Module):
                 **low_rank_diag,
                 "H": bounded,
                 "H_fro": torch.linalg.matrix_norm(bounded, ord="fro"),
+                "H_spectral_norm": torch.linalg.matrix_norm(bounded, ord=2),
+                "H_spectral_ratio": torch.linalg.matrix_norm(bounded, ord=2) / max(self.gamma, 1e-12),
                 "H_sample_variance": bounded.var(dim=0, unbiased=False).mean(),
                 "metric_eigenvalues": 1.0 + torch.linalg.eigvalsh(bounded),
             }
@@ -292,7 +294,13 @@ class MultiSourceAffectiveMetric(nn.Module):
             "fusion_mode": fusion_mode,
         }
         h_fro = [o.diagnostics["H_fro"].mean() for o in outputs if "H_fro" in o.diagnostics]
+        h_spectral = [o.diagnostics["H_spectral_norm"] for o in outputs if "H_spectral_norm" in o.diagnostics]
+        h_spectral_ratio = [o.diagnostics["H_spectral_ratio"] for o in outputs if "H_spectral_ratio" in o.diagnostics]
         h_var = [o.diagnostics["H_sample_variance"] for o in outputs if "H_sample_variance" in o.diagnostics]
         diagnostics["metric_H_fro_mean"] = logits.new_zeros(()) if not h_fro else torch.stack(h_fro).mean()
+        diagnostics["metric_H_spectral_norm_mean"] = logits.new_zeros(()) if not h_spectral else torch.stack(h_spectral).mean()
+        diagnostics["metric_H_spectral_norm_max"] = logits.new_zeros(()) if not h_spectral else torch.stack(h_spectral).max()
+        diagnostics["metric_H_spectral_ratio_mean"] = logits.new_zeros(()) if not h_spectral_ratio else torch.stack(h_spectral_ratio).mean()
+        diagnostics["metric_H_spectral_ratio_max"] = logits.new_zeros(()) if not h_spectral_ratio else torch.stack(h_spectral_ratio).max()
         diagnostics["metric_H_sample_variance"] = logits.new_zeros(()) if not h_var else torch.stack(h_var).mean()
         return C1Output(logits, regularization, relation, diagnostics)
