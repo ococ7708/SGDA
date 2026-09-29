@@ -2,19 +2,11 @@
 
 This repository contains the original SGDA implementation, the GeoSem-STDA research model, and the current SEED-IV C1/C2 experiments. Dataset files and pretrained CLIP weights are not included.
 
-## Active work: C1 metric-learning-rate optimization
+## Current priority: C1 frozen; prepare C2 and external-session handoff
 
-The immediate code task makes one constrained change to C1 E2: `metric_lr_multiplier` scales only the metric-mechanism optimizer group. Backbone LR, model architecture, fusion, rank, temperature, preprocessing, LOSO, training budget, and batch size remain unchanged. The resolved multiplier is included in the effective config and run hash. A uses multiplier 3 / gamma 0.5; B holds multiplier 3 and changes only gamma to 0.25. The formal scope is all three SEED-IV sessions separately, all 15 targets, and seeds 42/43/44 (135 runs per phase). B is gated on A's paired all-session consistency check.
+C1 optimization is frozen; do not launch further C1 A/B or shared-head exploration. Current main work is to establish whether C2's evidence-driven correction improves the frozen E0 reference, and whether historical evidence adds value beyond smoothing and a capacity-matched control. The C2 and supplementary SEED/SEED-V experiments are not being run by the repository owner in this preparation step; team members receive an explicit data interface, gated run commands, and delivery checklist in [docs/C2_TEAM_EXPERIMENT_HANDOFF.md](docs/C2_TEAM_EXPERIMENT_HANDOFF.md).
 
-Only smoke tests have been completed for the current all-session config. C1 smoke used target 6 / seed 42 / two epochs in each session; engineering-only accuracies were 0.2500, 0.6250, and 0.2500. The effective config hash was `fcb505a9e03ac832`; run manifests record backbone LR 0.001 and mechanism LR 0.003. These smoke metrics are not efficacy results. A previous A attempt used an earlier config hash: Session 1 / target 6 / seed 42 completed 200 epochs and recorded accuracy 0.3861 versus the paired E2 baseline 0.4807; seed 43 stopped at epoch 71 and seed 44 never started. That partial batch is excluded from the all-session analysis and does not establish a general negative or positive result.
-
-Run just the C1 engineering smoke with:
-
-```powershell
-python experiments\run_c1_metric_lr_smoke.py --device cuda:0
-```
-
-The full A/B run has not been launched. Preflight found only 90/135 matching E2 parent folds: all 45 Session 3 E2 parents are missing. The full C1 A phase is blocked until those exact parent checkpoints and metrics are completed and audited. `experiments/run_c1_e2_metric_lr_screen.py` enforces this parent check, then runs a full phase; A must finish and pass its recorded gate before B. Do not infer model performance from smoke runs or the interrupted earlier A batch. Full per-run outputs remain local under `results/` and are not committed.
+The C2 code supports per-machine data roots via `SGDA_SEEDIV_DATA_ROOT`, `SGDA_SEED_DATA_ROOT`, and `SGDA_SEEDV_DATA_ROOT`; optional `SGDA_C1_E0_ROOT` points to the exact E0 parent-results root. `experiments/check_dataset_interface.py` checks expected file layouts without modifying or loading the data. Full C2 remains gated: the currently audited exact E0 parent set has Sessions 1/2 (90/135 cells) but lacks the 45 Session 3 cells; the new three-session pilot must also pass and be owner-accepted before any full runs. The old two-session pilot is not a substitute.
 
 ## External single-session smoke: SEED and SEED-V
 
@@ -27,23 +19,13 @@ $env:SGDA_PYTHON = "python"
 
 The future 15-target SEED Session 2 and 16-target SEED-V Session 1 LOSO runs are deferred and must be launched separately. Keep datasets, class spaces, metrics, and summaries separate. Details and assignments are in [docs/SEED_SEEDV_SINGLE_SESSION_EXPLORATION.md](docs/SEED_SEEDV_SINGLE_SESSION_EXPLORATION.md).
 
-## Immediate three-member assignment
+## C2 experiment scope
 
-| Member | Task after smoke/code review | Coverage and handoff |
-|---|---|---|
-| A | First close the 45 missing Session 3 E2 parent folds and verify the full 135-cell E2 parent. Then own C1 phase A (`metric_lr_multiplier=3`, `gamma=0.5`) when full execution is scheduled. | All three SEED-IV sessions separately, 15 targets/session, seeds 42/43/44. Deliver per-run configs/hashes, logs, checkpoints, metrics, and failures. |
-| B | Own C1 phase B (`metric_lr_multiplier=3`, `gamma=0.25`), but start only if phase A completes and passes the predeclared gate. | Exactly the same folds as A. Deliver paired deltas, class-pair confusion changes, the two mechanism figures, and the stop/continue recommendation. |
-| C | Own the external-dataset work package and independent QA: SEED Session 2 and SEED-V Session 1, checking label mapping, local paths, smoke manifests, and separate summaries. | Current smoke is done; any later full LOSO is separately authorized. Review C1 run provenance and reproduce aggregate tables without pooling sessions or datasets. |
-
-For C1, A and B must not be split by session: both methods use the same complete three-session LOSO scope. The previous C2 method-based assignment below is a later, separate work package.
-
-## C2 planned follow-on scope
-
-The later C2 study asks whether held-out source evidence can predict which source/class-pair correction will improve the frozen E0 reference, and whether strictly past margin summaries add value beyond the current window and ordinary probability smoothing. The scope is **SEED-IV Sessions 1, 2, and 3, each evaluated separately**—never pooled for training—with all 15 subjects as outer targets and seeds 42, 43, and 44. This is 135 outer cells per method (not 135 total across all methods). Each C2 outer cell needs four inner teacher fits; those are cached and shared across that cell's C2 variants.
+The C2 study asks whether held-out source evidence can predict which source/class-pair correction will improve the frozen E0 reference, and whether strictly past margin summaries add value beyond the current window and ordinary probability smoothing. The scope is **SEED-IV Sessions 1, 2, and 3, each evaluated separately**—never pooled for training—with all 15 subjects as outer targets and seeds 42, 43, and 44. This is 135 outer cells per method (not 135 total across all methods). Each C2 outer cell needs four inner teacher fits; those are cached and shared across that cell's C2 variants.
 
 The frozen parent is the C1 E0 configuration `592351bfb649e601`. The new three-session C2 config has a distinct hash and records the exact parent checkpoint SHA-256 per run. The existing parent audit covers 90 E0 artifacts in Sessions 1 and 2; **the 45 Session 3 E0 parent checkpoints are currently missing from the audited path**. Consequently, the three-session parent audit is incomplete, and C2 full execution is blocked until those exact-config E0 runs are completed and audited. The previously passed single-fold pilot belongs to the old Sessions 1–2 configuration and is retained only as historical engineering evidence; it does not validate this expanded config or unlock the new matrix. No full three-session matrix has run.
 
-The new engineering pilot is fixed to Session 3 / target 1 / seed 42, so it can exercise the newly added session path. It cannot run until that exact E0 parent checkpoint is available and audited. The old Session 1 pilot remains inspectable but is not accepted as a substitute. After the Session 3 pilot passes and the owner signs its acceptance record, the full 135-cell-per-method matrix can start—only after all 135 E0 parents are present.
+The new engineering pilot is fixed to Session 3 / target 1 / seed 42, so it can exercise the newly added session path. It cannot run until that exact E0 parent checkpoint is available and audited. The old Session 1 pilot remains inspectable but is not accepted as a substitute. After the Session 3 pilot passes and the owner signs its acceptance record, the full 135-cell-per-method matrix can start—only after all 135 E0 parents are present. Group A/B/C assignments and exact per-member deliverables are in the handoff document above.
 
 ## Model at a glance
 
@@ -61,7 +43,7 @@ Normalization follows the parent per-subject rule: each evaluated subject contri
 
 ## C2 quick start
 
-Configure local dataset and CLIP paths in `data_utils/constants/path_mapper.py` and `data_utils/text_to_vector.py`. Use the locally prepared Python 3.11/PyTorch environment with a matching CUDA build; this checkout does not include a portable conda environment export.
+Configure local data roots with `SGDA_SEEDIV_DATA_ROOT`, `SGDA_SEED_DATA_ROOT`, and `SGDA_SEEDV_DATA_ROOT`; set the optional `SGDA_C1_E0_ROOT` to mount the exact frozen E0 result directory. Configure the CLIP model path in `data_utils/text_to_vector.py`. Use the locally prepared Python 3.11/PyTorch environment with a matching CUDA build; this checkout does not include a portable conda environment export.
 
 From the repository root in PowerShell:
 
@@ -95,17 +77,17 @@ The other planned contrasts are C2-current-EMA, C2-current-matched (same router 
 
 Each run is expected to retain config/parent/data hashes, actual inner splits, sample and time indices, teacher training records, evidence caches, epoch logs, both source-dev and target-report artifacts, sample-level predictions/actions/utilities, standard classification metrics, action/no-op and negative-utility rates, corrected/harmed prediction counts, and a reproducible run status. Final summaries are reported separately for each session and combined, with paired comparisons on matching session-target-seed cells; subject is the inferential cluster.
 
-## C2 follow-on work split
+## C2 member assignments
 
 Members own methods, not sessions. Every member covers Sessions 1, 2, and 3 separately for their assigned method family, using the same frozen E0 parent, all targets, all seeds, split protocol, and output schema. Each method therefore has 135 outer cells.
 
 | Member | Work package |
 |---|---|
-| A | E0 evidence export; B0 reference and B1 probability-EMA controls; frozen-reference/oracle checks; sample-level final-fusion diagnostics. |
+| A | B0 reference and B1 probability-EMA controls; frozen-reference checks; sample-level final-fusion diagnostics. |
 | B | OOF/source-dev teachers and provenance; evidence cache; C2-current MSE and current-structure Huber contrast. |
 | C | Strict history variant; C2-current-EMA; capacity-matched current-feature control; history, reset, and chunked-inference checks. |
 
-The detailed experiment plan names each deliverable and validation. Before the owner accepts the new Session 3 pilot and all 135 E0 parent cells pass audit, member work is limited to reviewing the shared code/protocol and fixing documented acceptance failures; do not start the full matrix. No member may alter the shared config, data, or code silently; changes require a versioned config and a recorded commit. Do not split sessions across members because method comparisons must cover the same complete scope.
+The [team handoff](docs/C2_TEAM_EXPERIMENT_HANDOFF.md) defines the machine data interface, group-only run commands, per-run deliverables, and final integration contract. Before the owner accepts the new Session 3 pilot and all 135 E0 parent cells pass audit, member work is limited to data preflight, code/protocol review, and documented acceptance fixes; do not start the full matrix. No member may alter the shared config, data, or code silently; changes require a versioned config and a recorded commit. Do not split sessions across members because method comparisons must cover the same complete scope.
 
 ## Original SGDA and other experiments
 

@@ -1,7 +1,7 @@
 """Auditable SEED-IV C2 pipeline built around the completed E0 checkpoints.
 
-The default operation is a read-only parent-artifact audit.  Real EEG work is
-only launched by the explicit ``pilot --execute`` or ``full --execute`` modes.
+The default operation is a read-only parent-artifact audit. Real EEG work is
+only launched by explicit pilot, team-group, or full execution modes.
 The full matrix is intentionally not run by this module during import/tests.
 """
 from __future__ import annotations
@@ -122,6 +122,13 @@ def _config_file_hash(path: Path) -> str:
     return sha256_file(path)
 
 
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path.resolve())
+
+
 def _implementation_hashes() -> dict[str, str]:
     files = (
         "experiments/seediv_c2_experiment.py",
@@ -135,6 +142,7 @@ def _implementation_hashes() -> dict[str, str]:
         "utils/seediv_c1_c2_protocol.py",
         "utils/mix_utils.py",
         "data_utils/load_data.py",
+        "data_utils/constants/path_mapper.py",
     )
     return {relative: sha256_file(ROOT / relative) for relative in files}
 
@@ -188,19 +196,23 @@ def _validate_pilot_acceptance(
 
 
 def _validate_full_matrix_scope(mode: str, sessions: list[int], targets: list[int], seeds: list[int],
-                                methods: list[str], config: dict[str, Any]) -> None:
-    if mode != "full":
+                                methods: list[str], config: dict[str, Any], owner: str | None = None) -> None:
+    if mode not in ("full", "group"):
         return
-    expected = (
-        list(config["sessions"]), list(config["subject_ids"]),
-        list(config["seeds"]), list(config["methods"]),
-    )
-    observed = (sessions, targets, seeds, methods)
-    if observed != expected:
+    expected_scope = (list(config["sessions"]), list(config["subject_ids"]), list(config["seeds"]))
+    if (sessions, targets, seeds) != expected_scope:
         raise RuntimeError(
-            "full mode requires the complete frozen matrix: Sessions 1/2/3, all 15 targets, "
-            "seeds 42/43/44, and every registered method in config order"
+            f"{mode} mode requires the complete frozen matrix: Sessions 1/2/3, all 15 targets, and seeds 42/43/44"
         )
+    if mode == "full":
+        if methods != list(config["methods"]):
+            raise RuntimeError("full mode requires every registered method in config order")
+    else:
+        if owner not in config["team_assignments"]:
+            raise RuntimeError("group mode requires --owner A, B, or C")
+        expected_methods = list(config["team_assignments"][owner])
+        if methods != expected_methods:
+            raise RuntimeError(f"group {owner} must run exactly {expected_methods} in config order")
 
 
 def audit_parent_matrix(config_path: Path, output: Path, *, load_weights: bool = True) -> dict[str, Any]:
@@ -272,7 +284,7 @@ def audit_parent_matrix(config_path: Path, output: Path, *, load_weights: bool =
                         "session": session,
                         "target": target,
                         "seed": seed,
-                        "relative_checkpoint_path": str(checkpoint_path.relative_to(ROOT)),
+                        "relative_checkpoint_path": _display_path(checkpoint_path),
                         "parent_config_hash": computed_hash,
                         "parent_checkpoint_sha256": digest,
                         "parent_best_epoch": int(metrics["best_epoch"]),
@@ -1385,7 +1397,7 @@ def execute_fold(
         "run_hash": None,
         "parent_config_hash": PARENT_CONFIG_HASH,
         "parent_checkpoint_sha256": parent_sha,
-        "parent_checkpoint_path": str(parent_path.relative_to(ROOT)),
+        "parent_checkpoint_path": _display_path(parent_path),
         "parent_best_epoch": int(parent_state["epoch"]),
         "parent_metrics": {key: parent_metrics[key] for key in ("accuracy", "macro_f1", "balanced_accuracy", "confusion_matrix")},
         "session": int(session),
@@ -1521,8 +1533,8 @@ def run_experiment(args) -> dict[str, Any]:
     implementation_hash = json_fingerprint(implementation_hashes)
     audit_path = ROOT / "artifacts" / "seediv_c2_s1s2s3_parent_audit.json"
     audit = audit_parent_matrix(config_path, audit_path, load_weights=True)
-    if args.mode == "full" and audit["status"] != "PASS":
-        raise RuntimeError(f"full C2 requires all 135 valid E0 parents; see {audit_path}")
+    if args.mode in ("full", "group") and audit["status"] != "PASS":
+        raise RuntimeError(f"{args.mode} C2 requires all 135 valid E0 parents; see {audit_path}")
     if args.mode == "pilot":
         pilot_key = (int(config["pilot"]["session"]), int(config["pilot"]["target"]), int(config["pilot"]["seed"]))
         if not any((int(cell["session"]), int(cell["target"]), int(cell["seed"])) == pilot_key for cell in audit["cells"]):
@@ -1543,6 +1555,7 @@ def run_experiment(args) -> dict[str, Any]:
                 "targets": config["subject_ids"],
                 "seeds": config["seeds"],
                 "methods": config["methods"],
+                "team_assignments": config["team_assignments"],
                 "runs_per_method": int(config["execution"]["runs_per_method"]),
                 "teacher_fits_per_fold_seed": 4,
                 "parent_audit_status": audit["status"],
@@ -1556,9 +1569,9 @@ def run_experiment(args) -> dict[str, Any]:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return plan
 
-    if args.mode in ("pilot", "full") and not args.execute:
+    if args.mode in ("pilot", "full", "group") and not args.execute:
         raise ValueError(f"{args.mode} performs EEG fitting; add --execute to launch it")
-    if args.mode == "full":
+    if args.mode in ("full", "group"):
         pilot_report_path = ROOT / args.pilot_report
         acceptance_path = ROOT / args.acceptance_record
         _validate_pilot_acceptance(pilot_report_path, acceptance_path, config_hash, implementation_hashes)
@@ -1579,6 +1592,15 @@ def run_experiment(args) -> dict[str, Any]:
         targets = [int(config["pilot"]["target"])]
         seeds = [int(config["pilot"]["seed"])]
         methods = list(config["pilot_methods"])
+    elif args.mode == "group":
+        sessions = _parse_id_list(args.sessions, list(config["sessions"]), "sessions")
+        targets = _parse_id_list(args.targets, list(config["subject_ids"]), "targets")
+        seeds = _parse_id_list(args.seeds, list(config["seeds"]), "seeds")
+        if args.owner not in config["team_assignments"]:
+            raise ValueError("group mode requires --owner A, B, or C")
+        methods = list(config["team_assignments"][args.owner])
+        if args.methods is not None and list(args.methods) != methods:
+            raise ValueError(f"group {args.owner} must run exactly {methods} in config order")
     else:
         sessions = _parse_id_list(args.sessions, list(config["sessions"]), "sessions")
         targets = _parse_id_list(args.targets, list(config["subject_ids"]), "targets")
@@ -1594,9 +1616,10 @@ def run_experiment(args) -> dict[str, Any]:
     if unknown_methods:
         raise ValueError(f"unregistered methods requested: {sorted(unknown_methods)}")
 
-    _validate_full_matrix_scope(args.mode, sessions, targets, seeds, methods, config)
+    _validate_full_matrix_scope(args.mode, sessions, targets, seeds, methods, config, args.owner)
     run_count = len(sessions) * len(targets) * len(seeds)
-    report_name = f"seediv_c2_s1s2s3_{args.mode}_report.json"
+    owner_suffix = f"_{args.owner}" if args.mode == "group" else ""
+    report_name = f"seediv_c2_s1s2s3_{args.mode}{owner_suffix}_report.json"
     report_path = ROOT / "artifacts" / report_name
     _write_json(report_path, {
         "status": "RUNNING",
@@ -1606,6 +1629,8 @@ def run_experiment(args) -> dict[str, Any]:
         "implementation_hash": implementation_hash,
         "config_path": str(config_path.relative_to(ROOT) if config_path.is_relative_to(ROOT) else config_path),
         "parent_audit": str(audit_path.relative_to(ROOT)),
+        "team_owner": args.owner if args.mode == "group" else None,
+        "team_assignments": config["team_assignments"],
         "device": str(device),
         "gpu_name": gpu_name,
         "sessions": sessions,
@@ -1660,6 +1685,7 @@ def run_experiment(args) -> dict[str, Any]:
     payload = {
         "status": "PASS" if not failures and len(rows) == expected_method_runs else "FAIL",
         "mode": args.mode,
+        "team_owner": args.owner if args.mode == "group" else None,
         "config_hash": config_hash,
         "parent_config_hash": PARENT_CONFIG_HASH,
         "parent_audit_status": audit["status"],
@@ -1687,7 +1713,7 @@ def run_experiment(args) -> dict[str, Any]:
     summary_rows = []
     for row in rows:
         summary_rows.append({key: value for key, value in row.items() if isinstance(value, (str, int, float, bool)) or value is None})
-    summary_csv = ROOT / "results" / "seediv_c2_e0_s1s2s3" / config_hash / f"{args.mode}_summary.csv"
+    summary_csv = ROOT / "results" / "seediv_c2_e0_s1s2s3" / config_hash / f"{args.mode}{owner_suffix}_summary.csv"
     summary_csv.parent.mkdir(parents=True, exist_ok=True)
     if summary_rows:
         keys = list(dict.fromkeys(key for row in summary_rows for key in row))
@@ -1702,7 +1728,7 @@ def run_experiment(args) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("audit", "plan", "pilot", "full"))
+    parser.add_argument("mode", choices=("audit", "plan", "pilot", "group", "full"))
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--execute", action="store_true", help="required to start the actual pilot/full fitting")
@@ -1710,6 +1736,7 @@ def main() -> None:
     parser.add_argument("--targets", nargs="+", type=int)
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--methods", nargs="+")
+    parser.add_argument("--owner", choices=("A", "B", "C"), help="required for disjoint team-group execution")
     parser.add_argument("--pilot-report", default="artifacts/seediv_c2_s1s2s3_pilot_report.json")
     parser.add_argument("--acceptance-record", default="artifacts/seediv_c2_s1s2s3_pilot_acceptance.json")
     args = parser.parse_args()

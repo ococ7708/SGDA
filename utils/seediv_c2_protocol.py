@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,7 @@ def load_c2_config(path: str | Path = DEFAULT_CONFIG) -> dict[str, Any]:
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     required = {
         "schema_version", "sessions", "subject_ids", "seeds", "parent_config_hash",
-        "inner_oof", "router", "methods", "pilot_methods", "action", "history",
+        "inner_oof", "router", "methods", "pilot_methods", "team_assignments", "action", "history",
     }
     missing = sorted(required - config.keys())
     if missing:
@@ -48,6 +49,12 @@ def load_c2_config(path: str | Path = DEFAULT_CONFIG) -> dict[str, Any]:
         raise ValueError("C2 scope must cover Sessions 1/2/3 and seeds 42/43/44")
     if config["router"]["action_mode"] != "single":
         raise ValueError("Only single-action C2 is registered in this first phase")
+    assignments = config["team_assignments"]
+    if set(assignments) != {"A", "B", "C"}:
+        raise ValueError("C2 team assignments must define members A, B, and C")
+    assigned = [method for member in ("A", "B", "C") for method in assignments[member]]
+    if len(assigned) != len(set(assigned)) or set(assigned) != set(config["methods"]):
+        raise ValueError("C2 team assignments must partition all registered methods exactly once")
     return config
 
 
@@ -56,7 +63,12 @@ def c2_config_hash(config: dict[str, Any]) -> str:
 
 
 def parent_checkpoint_path(session: int, target: int, seed: int, root: str | Path = ".") -> Path:
-    return Path(root) / PARENT_RESULTS / f"seed{int(seed)}" / f"session{int(session)}_target{int(target):02d}" / "target_best.pt"
+    configured_root = os.environ.get("SGDA_C1_E0_ROOT", "").strip()
+    if configured_root:
+        parent_root = Path(configured_root).expanduser().resolve()
+    else:
+        parent_root = Path(root) / PARENT_RESULTS
+    return parent_root / f"seed{int(seed)}" / f"session{int(session)}_target{int(target):02d}" / "target_best.pt"
 
 
 def parent_run_dir(session: int, target: int, seed: int, root: str | Path = ".") -> Path:

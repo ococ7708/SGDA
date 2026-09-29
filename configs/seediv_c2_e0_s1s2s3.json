@@ -105,6 +105,11 @@
     "C2-current-Huber"
   ],
   "pilot_methods": ["B0", "B1", "C2-current", "C2-history"],
+  "team_assignments": {
+    "A": ["B0", "B1"],
+    "B": ["C2-current", "C2-current-Huber"],
+    "C": ["C2-current-EMA", "C2-history", "C2-current-matched"]
+  },
   "action": {
     "utility": "CE(reference_logits, label) - CE(action_logits, label)",
     "residual": "clip((expert_margin-reference_margin), -residual_clip, +residual_clip)",
